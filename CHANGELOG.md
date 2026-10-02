@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-02
+## [1.0.0] - 2026-10-02
 
 Visuals and workflow adopted from crmne's hyprmoncfg (MIT).
 
