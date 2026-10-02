@@ -6,6 +6,91 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-02
+
+Visuals and workflow adopted from crmne's hyprmoncfg (MIT).
+
+### Added
+
+- A new stage for the canvas: a dot grid, display cards with a bezel, a
+  contact shadow and a lit panel (accent only on the selected one), showing
+  the number, connector, model and size, mode, scale and position.
+- Workspace chips in a row under each display's name, ending in +N when they
+  do not fit; when the plan changes, the moving chips glide to their new
+  display.
+- Spaces tab: the plan drawn on the stage, steppers for the workspace count
+  and group size (typed or −/+), persistent workspaces (none, the first per
+  display, all), a monitor order that says which display gets workspace 1,
+  a summary per display, and arrows on each workspace in manual mode.
+- Profiles tab: a small picture of each profile's layout, its match score,
+  expandable details (updated, why it matches, displays, workspaces), a
+  command to run after it is applied, and a switch for automatic profiles.
+- Arrange tab: typed X and Y, rotation and adaptive sync as button rows, a
+  reset beside each field that differs from what is live, sharp scales
+  under More, a hardware grid with Identify for one display, connected
+  displays with no signal, and a note on a card when a display runs below
+  what was saved.
+- The Display tab opens with a compact picture of the layout; the Keep card
+  shows the layout about to be kept.
+- `panelWidth` setting: compact (480 px), comfortable (600 px, the new
+  default) or wide (720 px).
+- IPC: `workspaces <strategy> [count]` drafts a workspace plan;
+  `resetDraft` drops unapplied edits.
+- A new marketplace preview (Arrange, Spaces and Colour with the main
+  features), rendered from `docs/preview/` by `scripts/preview.sh`.
+
+## [0.3.0] - 2026-10-02
+
+### Fixed
+
+- Switching a display from Mirror back to Extend left it mirroring: rules now
+  clear `mirror`. Mirrored layouts were refused, because Hyprland reports
+  `mirrorOf` as an id; it is mapped to the name.
+- Setting HDR, bit depth, adaptive sync, SDR levels or HDR details back to
+  "Default" left the old value live (Hyprland merges rules); they are now
+  written as Hyprland's defaults. Clearing an ICC profile reloads first.
+- A change to adaptive sync alone was ignored by Hyprland (its rule compare
+  skips `vrr`): it is now sent with a harmless nudge, then for real, for apply
+  and revert alike.
+- A new virtual output no longer inherits rules from an earlier one.
+
+### Added
+
+- Profiles at boot: the managed block carries every profile as guarded Lua
+  that Hyprland runs itself at load and on hotplug, so every desk has its
+  layout before the shell starts and after the plugin is removed. Remembered
+  monitors that are not connected keep a rule too.
+- A save mode that never edits `monitors.lua` (`state-file`): the same block in
+  Omarchy's toggles folder.
+- After saving, `hyprctl configerrors` is checked; new errors put the previous
+  file back.
+- Per-monitor memory: a known monitor in a new set gets its last mode,
+  scale, rotation and place, with an Undo notification (also after a profile
+  restore).
+- Modes only the EDID lists (common behind docks and adapters), applied as
+  the EDID's own modeline; a drifted refresh rate is mapped back to it.
+- HDR details: force HDR or wide colour, SDR white and black levels (203 nits
+  when HDR is turned on), peak, full-screen and black luminance prefilled
+  from the EDID, SDR transfer; requested vs actual preset; HDR calibration by
+  eye with PQ test patterns (mpv, ImageMagick).
+- HDR-aware brightness: in HDR the slider and `brightnessStep` (for the
+  brightness keys) set SDR brightness.
+- Mode keywords (preferred, highest resolution, highest refresh) and automatic
+  positions; seven more global options.
+- Several profiles per set of displays (the last used wins), duplicate, an
+  anchor display to measure from, and an arrangement kept per laptop mode.
+- Mirroring picks a mode both displays offer.
+- Layout health with Repair; Rescan; a full-screen arrangement editor (f).
+- Notice when the live layout drifts from the profile, with Restore or Keep
+  live; a display plugged in during a change reverts it.
+- `?` shows the keys; opt-in Setup › Displays row in the Omarchy menu; the
+  backlight slider follows the brightness keys; DDC colour preset;
+  `revert`, `keep` and `emergency` on the `omarchy.monitor` target.
+- Tablet: custom size, resize while running, listening state, Wi-Fi/Ethernet
+  labels, the SSH tunnel command, a new password takes effect at once, and the
+  last choices are remembered.
+- `tests/lua-profiles.test.js` runs the boot-time Lua in a real interpreter.
+
 ## [0.2.0] - 2026-10-02
 
 ### Added

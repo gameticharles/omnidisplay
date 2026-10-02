@@ -25,6 +25,7 @@
 #   resend-hdr <connector> <cm>   switch to sRGB and back, so the panel gets its HDR metadata again
 #   workspace-moves               stdin JSON [{workspace, name}]
 #   store-write                   stdin JSON; saves profiles.json atomically
+#   menu read | write             Omarchy's menu extensions file (write: stdin, after a backup)
 #   backups list | show <stamp> | restore <stamp>
 #   edid <connector>              edid-decode of the display's EDID
 #   ddc detect | get <bus> | set <bus> <vcp> <value>
@@ -130,6 +131,16 @@ cmd_snapshot() {
   read_file "$MONITORS_LUA"
   printf '\036'
   read_file "$STATE_LUA"
+  printf '\036'
+  # Connector status from the kernel: a display that is plugged in but that
+  # Hyprland does not list at all has no usable signal.
+  local f c s
+  for f in /sys/class/drm/card*-*/status; do
+    [[ -r $f ]] || continue
+    c=${f%/status}; c=${c##*/}; c=${c#card*-}
+    read -r s <"$f" || s=unknown
+    printf '%s %s\n' "$c" "$s"
+  done
 }
 
 # One status line (present | missing | toolarge | unreadable), the sha256,
@@ -546,6 +557,29 @@ cmd_resend_hdr() {
   printf '%s%s\n' "$MARKER" "$?"
 }
 
+# ------------------------------------------------------------------ menu
+
+MENU_JSONC="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
+
+# Omarchy's menu extensions file: the panel decides the new text (only ever
+# its one row added or removed, checked to parse); this writes it after a
+# backup.
+cmd_menu() {
+  case "${1:-read}" in
+    read) [[ -f $MENU_JSONC ]] && head -c 200000 -- "$MENU_JSONC" ;;
+    write)
+      local content
+      content=$(head -c 200000; printf x)
+      content=${content%x}
+      mkdir -p -- "$(dirname -- "$MENU_JSONC")" || die "cannot create the extensions folder"
+      [[ -f $MENU_JSONC ]] && cp -p -- "$MENU_JSONC" "$MENU_JSONC.omnidisplay.bak"
+      put_file "$MENU_JSONC" "$content" || die "cannot write the menu file"
+      printf '%s0\n' "$MARKER"
+      ;;
+    *) die "usage: menu read | write" ;;
+  esac
+}
+
 # ----------------------------------------------------------------- store
 
 # profiles.json, from stdin. Must be a JSON object with a profiles array.
@@ -628,18 +662,19 @@ cmd_ddc() {
     get)
       local bus="${2:-}"
       valid_int "$bus" || die "usage: ddc get <bus>"
-      ddcutil --bus "$bus" --brief getvcp 10 12 60 2>/dev/null | awk '
+      ddcutil --bus "$bus" --brief getvcp 10 12 60 14 2>/dev/null | awk '
         $1 == "VCP" && $3 == "C" { v[$2] = $4; m[$2] = $5 }
         $1 == "VCP" && $3 == "SNC" { v[$2] = $4 }
+        $1 == "VCP" && $3 == "CNC" { v[$2] = $4 }
         END {
-          printf "{\"brightness\":%s,\"brightnessMax\":%s,\"contrast\":%s,\"contrastMax\":%s,\"input\":\"%s\"}\n",
+          printf "{\"brightness\":%s,\"brightnessMax\":%s,\"contrast\":%s,\"contrastMax\":%s,\"input\":\"%s\",\"preset\":\"%s\"}\n",
             (v["10"] == "" ? -1 : v["10"]), (m["10"] == "" ? 100 : m["10"]),
-            (v["12"] == "" ? -1 : v["12"]), (m["12"] == "" ? 100 : m["12"]), v["60"]
+            (v["12"] == "" ? -1 : v["12"]), (m["12"] == "" ? 100 : m["12"]), v["60"], v["14"]
         }'
       ;;
     set)
       local bus="${2:-}" vcp="${3:-}" value="${4:-}"
-      valid_int "$bus" && [[ $vcp =~ ^(10|12|60)$ ]] && [[ $value =~ ^(0x[0-9a-fA-F]{1,4}|[0-9]{1,5})$ ]] || die "usage: ddc set <bus> <10|12|60> <value>"
+      valid_int "$bus" && [[ $vcp =~ ^(10|12|14|60)$ ]] && [[ $value =~ ^(0x[0-9a-fA-F]{1,4}|[0-9]{1,5})$ ]] || die "usage: ddc set <bus> <10|12|60> <value>"
       ddcutil --bus "$bus" --noverify setvcp "$vcp" "$value" >/dev/null 2>&1
       printf '%s%s\n' "$MARKER" "$?"
       ;;
@@ -863,6 +898,7 @@ case "$cmd" in
   eval-rules) cmd_eval_rules ;;
   workspace-moves) cmd_workspace_moves ;;
   store-write) cmd_store_write ;;
+  menu) cmd_menu "$@" ;;
   options) cmd_options ;;
   windows) cmd_windows ;;
   send-window) cmd_send_window "${1:-}" "${2:-}" ;;

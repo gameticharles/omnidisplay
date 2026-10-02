@@ -89,6 +89,16 @@ Requests Hyprland does not report back (adaptive sync, bit depth, colour
 preset, SDR levels) live in the profile and are merged into the draft from
 there; geometry always comes from the live state.
 
+## The saved block
+
+Rules for the displays connected now, rules for remembered monitors that are
+not (mode, scale, rotation, automatic position), the global options, and
+`Lua.profilesLua`: every profile as data plus a handler that picks the one
+matching the connected displays (enabled ones from `hl.get_monitors()`, off
+ones from sysfs by connector) at load and on `monitor.added`/`monitor.removed`,
+and applies it only when the match changes. All of it runs under `pcall`.
+`tests/lua-profiles.test.js` runs it in a real Lua with a fake `hl`.
+
 ## Other events
 
 - **Resume**: `gdbus monitor` on logind's `PrepareForSleep`; on wake the

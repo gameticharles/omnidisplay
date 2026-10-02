@@ -70,6 +70,7 @@ Column {
     if (t === "a") service.applyDraft()
     else if (t === "r") { canvas.grabbed = false; service.resetDraft() }
     else if (t === "p") showPreview = !showPreview
+    else if (t === "f") { service.fullArrangeOpen = true; panel.close() }
     else if (entry && (t === "+" || t === "=" || t === "-")) stepScale(t === "-" ? -1 : 1)
     else if (entry && t === "o") service.setTransform(entry.name, ((entry.transform || 0) + 1) % 4 + ((entry.transform || 0) >= 4 ? 4 : 0))
     else if (entry && t === "e" && (entry.enabled === false || Model.enabledCount(service.draft) > 1))
@@ -91,8 +92,24 @@ Column {
     width: parent.width
     height: implicitHeight
     service: view.service
+    notes: view.service.displayNotes
     foreground: view.fg
     fontFamily: view.ff
+  }
+
+  // Plugged in, but Hyprland does not show anything on it.
+  Repeater {
+    model: view.service.noSignal
+    Text {
+      required property string modelData
+      width: view.width
+      wrapMode: Text.WordWrap
+      textFormat: Text.PlainText
+      text: "⚠ " + modelData + " · No usable signal: plugged in, but nothing is shown on it. Try another cable or port, or Rescan."
+      color: Color.urgent
+      font.family: view.ff
+      font.pixelSize: Style.font.caption
+    }
   }
 
   // Displays that are off or mirroring have no place on the canvas.
@@ -176,6 +193,8 @@ Column {
     FieldRow {
       visible: !!view.entry && view.entry.enabled !== false && view.entry.modes.length > 0
       label: "Resolution"
+      hint: view.entry && view.service.fieldChanged(view.entry.name, ["width", "height", "refresh"])
+            ? "Was " + view.service.baseValue(view.entry.name, "width") + "×" + view.service.baseValue(view.entry.name, "height") : ""
       foreground: view.fg
       fontFamily: view.ff
       Dropdown {
@@ -185,7 +204,8 @@ Column {
         fontFamily: view.ff
         value: view.entry ? view.entry.width + "x" + view.entry.height : ""
         options: view.entry ? Model.resolutionOptions(view.entry).map(function(o, i) {
-          return { value: o.key, label: o.label + (i === 0 ? "  (native)" : "") }
+          return { value: o.key, label: o.label + (i === 0 ? "  (native)" : "")
+                   + (Model.isEdidOnly(view.entry, o.width, o.height) ? "  * from EDID" : "") }
         }) : []
         onChanged: function(v) {
           var p = v.split("x")
@@ -206,9 +226,47 @@ Column {
         fontFamily: view.ff
         value: view.entry ? Model.formatRefresh(view.entry.refresh) : ""
         options: view.entry ? Model.refreshOptions(view.entry, view.entry.width, view.entry.height).map(function(r) {
-          return { value: Model.formatRefresh(r), label: Model.formatRefresh(r) + " Hz" }
+          return { value: Model.formatRefresh(r), label: Model.formatRefresh(r) + " Hz"
+                   + (Model.modelineFor(view.entry, view.entry.width, view.entry.height, r) ? "  * from EDID" : "") }
         }) : []
         onChanged: function(v) { view.service.setRefresh(view.entry.name, Number(v)) }
+      }
+    }
+
+    // Let Hyprland choose: the preferred mode, the largest, or the fastest.
+    FieldRow {
+      visible: !!view.entry && view.entry.enabled !== false
+      label: "Mode"
+      hint: view.entry && view.entry.modeline ? "Applied as the EDID's own timing" : ""
+      foreground: view.fg
+      fontFamily: view.ff
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        foreground: view.fg
+        fontFamily: view.ff
+        value: view.entry ? (view.entry.modeKeyword || "") : ""
+        options: [{ value: "", label: "Exactly as chosen above" }, { value: "preferred", label: "The display's preferred mode" },
+                  { value: "highres", label: "Highest resolution" }, { value: "highrr", label: "Highest refresh rate" }]
+        onChanged: function(v) { view.service.setModeKeyword(view.entry.name, v) }
+      }
+    }
+
+    FieldRow {
+      visible: !!view.entry && view.entry.enabled !== false && !view.entry.mirror
+      label: "Position"
+      foreground: view.fg
+      fontFamily: view.ff
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        foreground: view.fg
+        fontFamily: view.ff
+        value: view.entry ? (view.entry.positionAuto || "") : ""
+        options: [{ value: "", label: "Where it is on the canvas" }, { value: "auto", label: "Automatic" },
+                  { value: "auto-right", label: "Automatic, to the right" }, { value: "auto-left", label: "Automatic, to the left" },
+                  { value: "auto-up", label: "Automatic, above" }, { value: "auto-down", label: "Automatic, below" }]
+        onChanged: function(v) { view.service.setPositionAuto(view.entry.name, v) }
       }
     }
 
@@ -278,6 +336,25 @@ Column {
             onClicked: view.service.setScale(view.entry.name, modelData.value)
           }
         }
+        // Every sharp scale for this mode, not only the presets.
+        Dropdown {
+          width: Style.space(96)
+          showLabel: false
+          foreground: view.fg
+          fontFamily: view.ff
+          value: ""
+          options: [{ value: "", label: "More" }].concat(view.entry ? Model.sharpScales(view.entry.width, view.entry.height).map(function(v) {
+            return { value: String(v), label: Model.normalizeScale(v) + "x" }
+          }) : [])
+          onChanged: function(v) { if (v) view.service.setScale(view.entry.name, Number(v)) }
+        }
+        PanelActionButton {
+          visible: !!view.entry && view.service.fieldChanged(view.entry.name, ["scale"])
+          iconText: "󰑓"
+          tooltipText: "Back to " + Model.normalizeScale(view.service.baseValue(view.entry ? view.entry.name : "", "scale")) + "x"
+          foreground: view.fg
+          onClicked: view.service.resetFields(view.entry.name, ["scale"])
+        }
       }
     }
 
@@ -286,14 +363,37 @@ Column {
       label: "Rotation"
       foreground: view.fg
       fontFamily: view.ff
-      Dropdown {
+      // The angle and Flipped are separate choices (Hyprland's 0-7).
+      Flow {
         width: parent.width
-        showLabel: false
-        foreground: view.fg
-        fontFamily: view.ff
-        value: view.entry ? String(view.entry.transform || 0) : "0"
-        options: Model.TRANSFORMS.map(function(t) { return { value: String(t.value), label: t.label } })
-        onChanged: function(v) { view.service.setTransform(view.entry.name, Number(v)) }
+        spacing: Style.spacing.xs
+        readonly property int t: view.entry ? (view.entry.transform || 0) : 0
+        ButtonGroup {
+          options: [{ value: "0", label: "Normal" }, { value: "1", label: "90°" }, { value: "2", label: "180°" }, { value: "3", label: "270°" }]
+          value: String(parent.t % 4)
+          foreground: view.fg
+          fontFamily: view.ff
+          fontSize: Style.font.caption
+          focusable: false
+          onChanged: function(v) { view.service.setTransform(view.entry.name, Number(v) + (parent.t >= 4 ? 4 : 0)) }
+        }
+        Button {
+          text: "Flipped"
+          fontSize: Style.font.caption
+          horizontalPadding: Style.spacing.sm
+          bordered: true
+          active: parent.t >= 4
+          foreground: view.fg
+          fontFamily: view.ff
+          onClicked: view.service.setTransform(view.entry.name, parent.t >= 4 ? parent.t - 4 : parent.t + 4)
+        }
+        PanelActionButton {
+          visible: !!view.entry && view.service.fieldChanged(view.entry.name, ["transform"])
+          iconText: "󰑓"
+          tooltipText: "Back to " + Model.transformLabel(view.service.baseValue(view.entry ? view.entry.name : "", "transform"))
+          foreground: view.fg
+          onClicked: view.service.resetFields(view.entry.name, ["transform"])
+        }
       }
     }
 
@@ -303,14 +403,64 @@ Column {
       hint: view.liveEntry && view.liveEntry.vrrActive ? "Active now" : ""
       foreground: view.fg
       fontFamily: view.ff
-      Dropdown {
+      Flow {
         width: parent.width
-        showLabel: false
-        foreground: view.fg
-        fontFamily: view.ff
-        value: view.entry ? String(view.entry.vrr) : "-1"
-        options: Model.VRR_MODES.map(function(m) { return { value: String(m.value), label: m.label } })
-        onChanged: function(v) { view.service.setVrr(view.entry.name, Number(v)) }
+        spacing: Style.spacing.xs
+        ButtonGroup {
+          options: Model.VRR_MODES.map(function(m) { return { value: String(m.value), label: m.value === 3 ? "Games" : m.label } })
+          value: view.entry ? String(view.entry.vrr) : "-1"
+          foreground: view.fg
+          fontFamily: view.ff
+          fontSize: Style.font.caption
+          focusable: false
+          onChanged: function(v) { view.service.setVrr(view.entry.name, Number(v)) }
+        }
+        PanelActionButton {
+          visible: !!view.entry && view.service.fieldChanged(view.entry.name, ["vrr"])
+          iconText: "󰑓"
+          tooltipText: "Back to the loaded value"
+          foreground: view.fg
+          onClicked: view.service.resetFields(view.entry.name, ["vrr"])
+        }
+      }
+    }
+
+    // Exact position in logical pixels; dragging and snapping stay the main way.
+    FieldRow {
+      visible: !!view.entry && Model.isArrangeable(view.entry)
+      label: "Position X · Y"
+      hint: view.entry && view.entry.positionAuto ? "Automatic (" + view.entry.positionAuto + ")" : "px"
+      foreground: view.fg
+      fontFamily: view.ff
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+        TextField {
+          id: posX
+          width: (parent.width - posReset.width - parent.spacing * 2) / 2
+          text: view.entry ? String(view.entry.x) : ""
+          foreground: view.fg
+          inputMethodHints: Qt.ImhFormattedNumbersOnly
+          onActiveFocusChanged: view.panel.textEditing = activeFocus
+          onAccepted: { view.service.setPosition(view.entry.name, Number(text), Number(posY.text)); focus = false; view.panel.textEditing = false }
+        }
+        TextField {
+          id: posY
+          width: posX.width
+          text: view.entry ? String(view.entry.y) : ""
+          foreground: view.fg
+          inputMethodHints: Qt.ImhFormattedNumbersOnly
+          onActiveFocusChanged: view.panel.textEditing = activeFocus
+          onAccepted: { view.service.setPosition(view.entry.name, Number(posX.text), Number(text)); focus = false; view.panel.textEditing = false }
+        }
+        PanelActionButton {
+          id: posReset
+          visible: !!view.entry && view.service.fieldChanged(view.entry.name, ["x", "y", "positionAuto"])
+          iconText: "󰑓"
+          tooltipText: "Back to where it is now"
+          foreground: view.fg
+          onClicked: view.service.resetFields(view.entry.name, ["x", "y", "positionAuto"])
+        }
       }
     }
 
@@ -369,6 +519,40 @@ Column {
     }
   }
 
+  // --------------------------------------------------------- layout health
+
+  Section {
+    visible: view.service.layoutIssues.length > 0
+    title: "LAYOUT"
+    trailing: view.service.layoutIssues.length + " ISSUE" + (view.service.layoutIssues.length === 1 ? "" : "S")
+    foreground: view.fg
+    fontFamily: view.ff
+
+    Repeater {
+      model: view.service.layoutIssues
+      Text {
+        required property var modelData
+        width: view.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: "⚠ " + modelData.message
+        color: Color.urgent
+        font.family: view.ff
+        font.pixelSize: Style.font.caption
+      }
+    }
+    Button {
+      anchors.right: parent.right
+      text: "Repair"
+      tooltipText: "Re-seat the displays flush, starting at 0×0, and fix broken mirrors (with the countdown)"
+      bordered: true
+      fontSize: Style.font.caption
+      foreground: view.fg
+      fontFamily: view.ff
+      onClicked: view.service.repairLayout()
+    }
+  }
+
   // -------------------------------------------------------------- insights
 
   Section {
@@ -418,40 +602,46 @@ Column {
 
   Section {
     visible: !!view.liveEntry
-    title: "DETAILS"
+    title: "HARDWARE"
     trailing: "CLICK A VALUE TO COPY"
     foreground: view.fg
     fontFamily: view.ff
 
     Grid {
+      id: hwGrid
       width: parent.width
-      columns: 2
-      columnSpacing: Style.space(10)
+      columns: 4
+      columnSpacing: Style.space(8)
       rowSpacing: Style.space(4)
+      readonly property real keyWidth: Style.space(78)
+      readonly property real valueWidth: (width - 2 * keyWidth - 3 * columnSpacing) / 2
 
       Repeater {
         model: {
           var e = view.liveEntry
           if (!e) return []
+          var native = Model.nativeMode(e)
           var rows = [
-            ["Make", e.make], ["Model", e.model], ["Serial", e.serial], ["Port", e.name],
-            ["Mode", Model.modeLabel(e)],
-            ["Size", e.physicalWidth ? e.physicalWidth + " × " + e.physicalHeight + " mm (" + Model.diagonalInches(e.physicalWidth, e.physicalHeight) + "\")" : ""],
+            ["Connector", e.name], ["Model", e.model], ["Type", e.internal ? "Built-in display" : "External display"],
+            ["Make", e.make], ["Max resolution", native ? native.width + "×" + native.height : ""], ["Serial", e.serial],
+            ["Panel size", e.physicalWidth ? (Model.inchesLabel(e) + " (" + e.physicalWidth + "×" + e.physicalHeight + " mm)") : ""],
             ["Density", Model.pixelDensity(e) ? Model.pixelDensity(e) + " PPI" : ""],
-            ["Format", e.format + " (" + e.liveBitdepth + "-bit)"],
+            ["Mode", Model.modeLabel(e)], ["Format", e.format + " (" + e.liveBitdepth + "-bit)"],
             ["Colour", e.cm], ["Position", e.x + " × " + e.y]
           ]
           var lines = Model.capabilityLines(view.caps && !view.caps.missing ? view.caps : null)
           for (var i = 0; i < lines.length; i++) rows.push([lines[i].label, lines[i].value])
-          var out = []
-          for (var k = 0; k < rows.length; k++) if (rows[k][1]) { out.push({ k: rows[k][0], v: String(rows[k][1]) }) }
           var flat = []
-          for (var j = 0; j < out.length; j++) { flat.push({ text: out[j].k, key: true }); flat.push({ text: out[j].v, key: false }) }
+          for (var k = 0; k < rows.length; k++) {
+            if (!rows[k][1]) continue
+            flat.push({ text: rows[k][0], key: true })
+            flat.push({ text: String(rows[k][1]), key: false })
+          }
           return flat
         }
         Text {
           required property var modelData
-          width: modelData.key ? Style.space(110) : view.width - Style.space(120)
+          width: modelData.key ? hwGrid.keyWidth : hwGrid.valueWidth
           textFormat: Text.PlainText
           text: modelData.text
           color: modelData.key ? view.dim : view.fg
@@ -467,6 +657,17 @@ Column {
         }
       }
     }
+
+    Button {
+      anchors.right: parent.right
+      text: "Identify"
+      tooltipText: "Show this display's number on it"
+      fontSize: Style.font.caption
+      bordered: true
+      foreground: view.fg
+      fontFamily: view.ff
+      onClicked: view.service.identifyOne(view.liveEntry.name)
+    }
   }
 
   // --------------------------------------------------------------- actions
@@ -477,6 +678,22 @@ Column {
     anchors.right: parent.right
     spacing: Style.space(8)
 
+    Button {
+      text: "Rescan"
+      tooltipText: "Read displays, EDIDs and DDC again"
+      bordered: true
+      foreground: view.fg
+      fontFamily: view.ff
+      onClicked: view.service.rescan()
+    }
+    Button {
+      text: "Full screen"
+      tooltipText: "Arrange on a whole screen (f)"
+      bordered: true
+      foreground: view.fg
+      fontFamily: view.ff
+      onClicked: { view.service.fullArrangeOpen = true; view.panel.close() }
+    }
     Button {
       text: "Reset"
       bordered: true

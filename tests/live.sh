@@ -130,6 +130,13 @@ check "a mode the display does not offer is refused before anything runs" '[[ $(
 check "nothing is pending after a refusal" '[[ $(pending) == "" ]]'
 
 echo
+echo "workspace planner"
+plan=$(ipc workspaces interleaved 4)
+check "interleaved deals workspaces out in turn" '[[ $plan == *"$OUT: 2,4"* ]]' "$plan"
+check "off writes no rules" '[[ $(ipc workspaces off 0) == "no rules" ]]'
+ipc resetDraft >/dev/null
+
+echo
 echo "global option"
 tearing=$(hyprctl getoption general:allow_tearing -j | jq .bool)
 flip=$([[ $tearing == true ]] && echo false || echo true)

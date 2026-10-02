@@ -4,6 +4,7 @@ import qs.Commons
 import "../lib/Model.js" as Model
 import "../lib/Profiles.js" as Profiles
 import "../components"
+import "../lib/Lua.js" as Lua
 
 // The Profiles tab: one saved arrangement per set of displays, switched to
 // automatically when that set is connected; the monitors.lua backups with
@@ -18,6 +19,7 @@ Column {
   readonly property color dim: panel.dim
 
   property string renaming: ""
+  property string expanded: ""
   property string confirmDelete: ""
   property string confirmRestore: ""
   readonly property var connectedKey: Profiles.connectedKey(service.monitors)
@@ -44,6 +46,16 @@ Column {
     trailing: view.service.autoProfiles ? "SWITCHES AUTOMATICALLY" : "AUTO SWITCH OFF"
     foreground: view.fg
     fontFamily: view.ff
+
+    Toggle {
+      width: parent.width
+      label: "Automatically use the best profile"
+      description: "Matches the connected displays to your saved profiles on plug, unplug, reload and wake. Off keeps what is on screen."
+      checked: view.service.autoProfiles
+      foreground: view.fg
+      fontFamily: view.ff
+      onClicked: view.service.setAutoProfiles(!view.service.autoProfiles)
+    }
 
     Text {
       width: parent.width
@@ -131,19 +143,46 @@ Column {
         id: card
         required property var modelData
         readonly property bool here: Profiles.sameSet(modelData.displays, view.connectedKey)
+        readonly property bool inForce: !!view.service.activeProfile && view.service.activeProfile.id === modelData.id
         width: view.width
-        implicitHeight: cardCol.implicitHeight + Style.space(14)
+        implicitHeight: Math.max(cardCol.implicitHeight, Style.space(46)) + Style.space(16)
         current: here
         foreground: view.fg
         fill: Style.hoverFillFor(view.fg, Color.accent)
         currentFill: Style.selectedFillFor(view.fg, Color.accent)
 
+        readonly property var match: Profiles.matchInfo(modelData, view.service.monitors)
+        readonly property bool open: view.expanded === modelData.id
+
+        // A small picture of the profile's arrangement.
+        MonitorCanvas {
+          id: thumb
+          anchors.left: parent.left
+          anchors.top: parent.top
+          anchors.leftMargin: Style.space(8)
+          anchors.topMargin: Style.space(8)
+          width: Style.space(76)
+          height: Style.space(46)
+          interactive: false
+          layout: Profiles.entriesFromProfile(card.modelData).filter(Model.isArrangeable)
+          workspacePlan: []
+          foreground: view.fg
+          fontFamily: view.ff
+        }
+
+        MouseArea {
+          anchors.fill: thumb
+          cursorShape: Qt.PointingHandCursor
+          onClicked: view.expanded = card.open ? "" : card.modelData.id
+        }
+
         Column {
           id: cardCol
-          anchors.left: parent.left
+          anchors.left: thumb.right
           anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.space(8)
+          anchors.top: parent.top
+          anchors.topMargin: Style.space(7)
+          anchors.leftMargin: Style.space(10)
           anchors.rightMargin: Style.space(8)
           spacing: Style.space(4)
 
@@ -158,7 +197,8 @@ Column {
               anchors.right: actions.left
               anchors.verticalCenter: parent.verticalCenter
               textFormat: Text.PlainText
-              text: card.modelData.name + (card.here ? "  · connected" : "")
+              text: card.modelData.name + (card.inForce ? "  · in force" : card.here ? "  · for these displays" : "")
+                    + "   " + card.match.score
               color: view.fg
               font.family: view.ff
               font.pixelSize: Style.font.body
@@ -185,11 +225,17 @@ Column {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
               PanelActionButton {
-                visible: card.here
+                visible: card.here && !card.inForce
                 iconText: "󰐊"
-                tooltipText: "Apply this profile"
+                tooltipText: "Use this profile (with the countdown)"
                 foreground: view.fg
                 onClicked: view.service.applyProfile(card.modelData.id)
+              }
+              PanelActionButton {
+                iconText: "󰆏"
+                tooltipText: "Duplicate (the copy is in force: tweak it for presenting, say)"
+                foreground: view.fg
+                onClicked: view.service.duplicateProfile(card.modelData.id)
               }
               PanelActionButton {
                 iconText: "󰏫"
@@ -217,6 +263,39 @@ Column {
             font.family: view.ff
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+          }
+
+          Row {
+            visible: card.modelData.displays.length > 1
+            spacing: Style.space(6)
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "Measure from:"
+              color: view.dim
+              font.family: view.ff
+              font.pixelSize: Style.font.caption
+            }
+            Dropdown {
+              width: Style.space(220)
+              showLabel: false
+              foreground: view.fg
+              fontFamily: view.ff
+              value: card.modelData.anchor || ""
+              options: [{ value: "", label: "The first display" }].concat(card.modelData.displays.map(function(d) {
+                return { value: d, label: d.length > 30 ? d.substring(0, 28) + "…" : d }
+              }))
+              onChanged: function(v) { view.service.setProfileAnchor(card.modelData.id, v) }
+            }
+          }
+
+          Text {
+            visible: Object.keys(card.modelData.variants || {}).length > 1
+            textFormat: Text.PlainText
+            text: "Own arrangement for: " + Object.keys(card.modelData.variants).map(function(m) { return Profiles.laptopModeLabel(m) }).join(", ")
+            color: view.dim
+            font.family: view.ff
+            font.pixelSize: Style.font.caption
           }
 
           Row {
@@ -248,6 +327,75 @@ Column {
             color: view.dim
             font.family: view.ff
             font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: card.open ? "Hide details" : "Details"
+            color: Color.accent
+            font.family: view.ff
+            font.pixelSize: Style.font.caption
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: view.expanded = card.open ? "" : card.modelData.id }
+          }
+
+          // Details: when, how well it matches and why, its workspaces, and
+          // a command to run after it is applied.
+          Grid {
+            visible: card.open
+            width: parent.width
+            columns: 2
+            columnSpacing: Style.space(10)
+            rowSpacing: Style.space(3)
+            Repeater {
+              model: {
+                var p = card.modelData
+                var rows = [["Updated", p.updated ? new Date(p.updated * 1000).toLocaleString(Qt.locale(), "yyyy-MM-dd HH:mm") : "—"],
+                            ["Match", (card.match.exact ? "exact · " : "") + "score " + card.match.score]]
+                for (var i = 0; i < card.match.reasons.length; i++) rows.push(["", card.match.reasons[i]])
+                rows.push(["Displays", p.displays.length + " saved · " + card.match.shared + " connected"])
+                var entries = Profiles.entriesFromProfile(p)
+                var plan = Profiles.planWorkspaces(entries, p.workspaces)
+                entries.filter(Model.isArrangeable).forEach(function(e) {
+                  var mine = plan.filter(function(r) { return r.name === e.name }).map(function(r) { return r.workspace })
+                  if (mine.length) rows.push([e.name, mine.join(", ")])
+                })
+                var flat = []
+                rows.forEach(function(r) { flat.push({ t: r[0], k: true }); flat.push({ t: r[1], k: false }) })
+                return flat
+              }
+              Text {
+                required property var modelData
+                width: modelData.k ? Style.space(70) : cardCol.width - Style.space(80)
+                textFormat: Text.PlainText
+                text: modelData.t
+                color: modelData.k ? view.dim : view.fg
+                font.family: view.ff
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+          }
+
+          Column {
+            visible: card.open
+            width: parent.width
+            spacing: Style.space(3)
+            Text {
+              textFormat: Text.PlainText
+              text: "After applying, run"
+              color: view.dim
+              font.family: view.ff
+              font.pixelSize: Style.font.caption
+            }
+            TextField {
+              width: parent.width
+              text: card.modelData.postApply || ""
+              placeholderText: "Not set (e.g. a command that restarts something)"
+              foreground: view.fg
+              onActiveFocusChanged: view.panel.textEditing = activeFocus
+              onAccepted: { view.service.setProfilePostApply(card.modelData.id, text); focus = false; view.panel.textEditing = false }
+              Keys.onEscapePressed: { text = card.modelData.postApply || ""; focus = false; view.panel.textEditing = false }
+            }
           }
         }
       }
@@ -297,6 +445,61 @@ Column {
     }
   }
 
+  // ---------------------------------------------------- where kept goes
+
+  Section {
+    title: "WHERE KEPT SETTINGS GO"
+    trailing: view.service.persistMode.toUpperCase()
+    foreground: view.fg
+    fontFamily: view.ff
+
+    Text {
+      width: parent.width
+      wrapMode: Text.WordWrap
+      textFormat: Text.PlainText
+      text: view.service.persistMode === "state-file"
+        ? "A file in Omarchy's toggles folder (display-omnidisplay.lua); monitors.lua is not edited. It carries every profile, so Hyprland applies the right one from boot."
+        : view.service.persistMode === "service-only"
+          ? "No file: profiles come back once the shell is running. Change this in the widget's settings."
+          : "One block at the end of monitors.lua. It carries every profile, so Hyprland applies the right one from boot."
+      color: view.dim
+      font.family: view.ff
+      font.pixelSize: Style.font.caption
+    }
+    FieldRow {
+      visible: view.service.staleMonitorsBlock
+      label: "monitors.lua still has OmniDisplay's block"
+      labelRatio: 0.62
+      foreground: view.fg
+      fontFamily: view.ff
+      Button {
+        anchors.right: parent.right
+        text: "Remove it"
+        bordered: true
+        fontSize: Style.font.caption
+        foreground: view.fg
+        fontFamily: view.ff
+        onClicked: view.service.removeMonitorsBlock()
+      }
+    }
+    FieldRow {
+      visible: view.service.staleStateFile
+      label: "The toggles folder still has OmniDisplay's file"
+      labelRatio: 0.62
+      foreground: view.fg
+      fontFamily: view.ff
+      Button {
+        anchors.right: parent.right
+        text: "Remove it"
+        bordered: true
+        fontSize: Style.font.caption
+        foreground: view.fg
+        fontFamily: view.ff
+        onClicked: view.service.removeStateFile()
+      }
+    }
+  }
+
   // --------------------------------------------------------------- backups
 
   Section {
@@ -343,6 +546,21 @@ Column {
   }
 
   // ---------------------------------------------------------------- help
+
+  Section {
+    title: "OMARCHY MENU"
+    foreground: view.fg
+    fontFamily: view.ff
+    Toggle {
+      width: parent.width
+      label: "Setup › Displays in the Omarchy menu"
+      description: "Adds one row to ~/.config/omarchy/extensions/omarchy-menu.jsonc (only if the file still reads the same apart from it). Off removes it."
+      checked: view.service.menuRowPresent
+      foreground: view.fg
+      fontFamily: view.ff
+      onClicked: view.service.setMenuRow(!view.service.menuRowPresent)
+    }
+  }
 
   Section {
     title: "TROUBLE"

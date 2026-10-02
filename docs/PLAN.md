@@ -386,7 +386,25 @@ reimplemented, not copied, and credited in the README.
 
 ---
 
-## 12. Status (2026-10-02, 0.2.0)
+## 12. Status (2026-10-02, 0.4.0)
+
+0.4.0 took hyprmoncfg's look and workflow: the stage with lit cards, chips
+that glide when the workspace plan changes, the workspace planner with
+steppers, persistence and monitor order, profile pictures and details, field
+resets, and a wider panel (600 px by default). Rendered and checked live on a
+virtual output; `tests/live.sh` has 24 checks.
+
+### 0.3.0
+
+0.3.0 implemented the three tiers from comparing Better Displays Pro, Vista
+and Virtual Display (see CHANGELOG): correctness (complete rules, VRR,
+configerrors, drift, hotplug during apply), boot-time profiles in Lua, the
+state-file mode, per-monitor memory with Undo, EDID modelines, full HDR,
+HDR-aware brightness, and the Tier 3 profile, layout, menu, tablet and
+calibration features. Not verifiable here: HDR calibration and HDR presets
+(no HDR panel), DDC, a real cast and tablet session, a real second monitor.
+
+### 0.2.0
 
 0.2.0 added what the 0.1.0 review found missing: phase timeouts, an exact
 revert (snapshot re-applied until it matches, read fresh at Apply), resume

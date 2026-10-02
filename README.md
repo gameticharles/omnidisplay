@@ -10,7 +10,7 @@ Every change goes live first and is kept only when you say so. If you don't,
 or the change takes your screen (or the whole shell) down, it reverts on its
 own.
 
-![OmniDisplay's Arrange tab](preview.png)
+![OmniDisplay: the Arrange, Spaces and Colour tabs](preview.png)
 
 OmniDisplay replaces Omarchy's built-in **Display** widget, so it sits where
 that one was and opens with `SUPER + CTRL + D`. Disable it and the built-in
@@ -21,10 +21,10 @@ widget comes back.
 | Tab | What it does |
 |---|---|
 | **Display** | Brightness for every display (laptop backlight, Apple displays and external monitors over DDC/CI, through Omarchy's own brightness command), text size, per-terminal font sizes, scale presets for one display or all of them, laptop modes (Extend, Mirror, External only, Built-in only), turning displays on and off, night light, presentation mode |
-| **Arrange** | Drag-and-drop arrangement for any number of displays, snapping flush to the nearest edge; place a display left of, right of, above or below another, aligned at the start, centre or end; resolution, refresh rate, custom modes, clean scales with a suggestion from the panel's pixel density, all eight rotations and flips, mirror one display while extending onto others, adaptive sync; insights such as "not at native resolution" or "limited by the connection" with a one-click fix; make, model, serial, size, density, all click-to-copy |
+| **Arrange** | A stage with a dot grid and lit display cards (number, connector, model and size, mode, scale and position, and a note when a display runs below what was saved); drag-and-drop arrangement for any number of displays, snapping flush to the nearest edge; place a display left of, right of, above or below another, aligned at the start, centre or end; resolution, refresh rate, custom modes, clean scales with a suggestion from the panel's pixel density, all eight rotations and flips, typed X and Y, a reset beside every changed field, sharp scales (exact divisors of the resolution) under More, mirror one display while extending onto others, adaptive sync; insights such as "not at native resolution" or "limited by the connection" with a one-click fix; make, model, serial, size, density, all click-to-copy |
 | **Colour** | Colour presets including HDR, 8 or 10-bit, SDR brightness and saturation in HDR, an ICC profile, what the panel's EDID says it can do; contrast and input source over DDC/CI; for all displays: default adaptive sync, tearing, direct scan-out, automatic HDR |
-| **Spaces** | Workspace planner: sequential (1–3, 4–6…), interleaved (odd/even), manual, or off |
-| **Profiles** | One profile per set of displays (the desk, the office, the projector), found again by the panels themselves, so a cable moving to another port or dock still matches; switched to automatically, also after resume; a new set can start from the profile it shares most displays with; backups of `monitors.lua` with restore; cleanup of what other display plugins left behind; a diagnostic report |
+| **Spaces** | Workspace planner drawn on the stage: chips on each display glide to their new display as the plan changes; sequential (1–3, 4–6…), interleaved (odd/even), manual (arrows per workspace), or off; workspace count and group size steppers; persistent workspaces (none, the first per display, all); a monitor order that says which display gets workspace 1 |
+| **Profiles** | Profiles per set of displays (several allowed; the last used wins; duplicate; an anchor display; an arrangement per laptop mode) (the desk, the office, the projector), found again by the panels themselves, so a cable moving to another port or dock still matches; switched to automatically, also after resume; a new set can start from the profile it shares most displays with; backups of `monitors.lua` with restore; cleanup of what other display plugins left behind; a small picture of each profile's layout with its match score and details; a command to run after a profile is applied; a switch to turn automatic profiles off from the panel; a diagnostic report |
 | **Cast** | Miracast and AirPlay displays, mirroring or extending; a tablet or phone as a screen over VNC; show one window on a cast or tablet screen |
 
 And on every screen: **Identify** (a big number per screen, matching the
@@ -107,9 +107,11 @@ omarchy-shell omnidisplay setMode DP-2 2560x1440@144
 omarchy-shell omnidisplay disable HDMI-A-1
 omarchy-shell omnidisplay option general.allow_tearing true   # misc.vrr, render.direct_scanout, render.cm_auto_hdr
 omarchy-shell omnidisplay resendHdr         # after a panel drops out of HDR
+omarchy-shell omnidisplay brightnessStep +5%   # HDR-aware: SDR brightness in HDR, the backlight otherwise
 omarchy-shell omnidisplay keep              # or: revert
 omarchy-shell omnidisplay emergency         # revert, or undo the last kept change
 omarchy-shell omnidisplay identify
+omarchy-shell omnidisplay workspaces interleaved 10   # draft a workspace plan; Apply in the panel
 omarchy-shell omnidisplay state             # JSON
 ```
 
@@ -133,8 +135,9 @@ Omarchy's widget settings:
 | Setting | Default | Meaning |
 |---|---|---|
 | `barLabel` | `none` | Text beside the icon: `count`, `profile` or `cast` |
+| `panelWidth` | `comfortable` | `compact` (480 px), `comfortable` (600 px) or `wide` (720 px); never wider than the screen |
 | `confirmSeconds` | `15` | Seconds to keep a change before it reverts |
-| `persistMode` | `block+service` | `block+service` writes the managed block in `monitors.lua` (right from boot) and restores profiles on hotplug; `service-only` never edits `monitors.lua` |
+| `persistMode` | `block+service` | `block+service` writes the managed block in `monitors.lua`; `state-file` writes the same to `~/.local/state/omarchy/toggles/hypr/display-omnidisplay.lua` and never edits `monitors.lua`; both carry every profile, so Hyprland applies the right one from boot. `service-only` writes no file |
 | `autoProfiles` | `true` | Apply the profile for the connected displays on hotplug and config reloads |
 | `backupsKept` | `10` | `monitors.lua` backups kept |
 | `snapThreshold` | `48` | Snapping distance on the canvas, logical px |
@@ -205,6 +208,12 @@ can then keep the change live without saving, or revert. Displays are
 written by panel (`desc:Make Model Serial`) when that singles one out,
 reusing a selector your own rules already use.
 
+**At boot** Hyprland applies the matching profile itself: the managed block
+carries every profile as guarded Lua (everything under `pcall`, so it can
+never break the config), with rules for remembered monitors too. Keeping
+also checks `hyprctl configerrors` and puts the previous file back if the new
+one brought errors.
+
 **Profiles** are restored by the service on hotplug and config reloads,
 without a countdown (they were confirmed when kept), and at most twice in a
 row if Hyprland keeps refusing something.
@@ -255,8 +264,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 
 OmniDisplay brings together ideas and code from Omarchy's Display widget,
 Steve Derico's Displays, Krzysztof Golab Magalhaes' Display with Monitor
-Layout, Filippo Veneri's Wireless Display, nightdevil00's Better Displays and
-Azteriisk's Display Manager, all MIT. See [NOTICE](NOTICE).
+Layout, Filippo Veneri's Wireless Display, nightdevil00's Better Displays,
+Azteriisk's Display Manager and Carmine Paolino's hyprmoncfg, all MIT. See [NOTICE](NOTICE).
 
 ## License
 

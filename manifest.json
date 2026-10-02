@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omnidisplay",
   "name": "OmniDisplay",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "author": "Charles Gameti",
   "license": "MIT",
   "description": "Every display setting in one bar widget: drag-and-drop arrangement, resolution, refresh, scale, rotation, mirroring, HDR and colour, adaptive sync, brightness (backlight and DDC/CI), auto-switching profiles, workspace planning, Miracast/AirPlay casting and tablet screens, with every change kept only after you confirm it.",
@@ -54,6 +54,7 @@
     "defaultSection": "right",
     "defaults": {
       "barLabel": "none",
+      "panelWidth": "comfortable",
       "confirmSeconds": 15,
       "persistMode": "block+service",
       "autoProfiles": true,
@@ -82,6 +83,18 @@
         "description": "How many displays are on, the active profile's name, or what a cast is doing. Vertical bars stay icon-only."
       },
       {
+        "key": "panelWidth",
+        "type": "enum",
+        "label": "Panel width",
+        "options": [
+          "compact",
+          "comfortable",
+          "wide"
+        ],
+        "defaultValue": "comfortable",
+        "description": "compact is 480 px, comfortable 600 px and wide 720 px. The panel never grows past the screen."
+      },
+      {
         "key": "confirmSeconds",
         "type": "integer",
         "label": "Seconds to keep a change",
@@ -97,10 +110,11 @@
         "label": "Where kept settings go",
         "options": [
           "block+service",
+          "state-file",
           "service-only"
         ],
         "defaultValue": "block+service",
-        "description": "block+service writes one managed block at the end of monitors.lua (right from boot) and restores profiles on hotplug. service-only never edits monitors.lua."
+        "description": "block+service writes one managed block at the end of monitors.lua. state-file writes the same to a file in Omarchy's toggles folder and never edits monitors.lua. Both carry every profile, so Hyprland applies the right one from boot. service-only writes no file: profiles are restored once the shell runs."
       },
       {
         "key": "autoProfiles",

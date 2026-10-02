@@ -59,7 +59,11 @@ Column {
     visible: !!view.entry
     separator: false
     title: view.entry ? ("COLOUR · " + Model.displayLabel(view.entry)).toUpperCase() : ""
-    trailing: view.live ? "NOW " + view.live.cm.toUpperCase() + " · " + view.live.liveBitdepth + "-BIT" : ""
+    // Requested next to what Hyprland actually uses: a preset the panel
+    // cannot do falls back silently otherwise.
+    trailing: view.live ? (view.entry && view.entry.cmSet && view.entry.cmSet !== view.live.cm
+                           ? "ASKED " + view.entry.cmSet.toUpperCase() + " · NOW " : "NOW ")
+                          + view.live.cm.toUpperCase() + " · " + view.live.liveBitdepth + "-BIT" : ""
     foreground: view.fg
     fontFamily: view.ff
 
@@ -220,6 +224,217 @@ Column {
     }
   }
 
+  // HDR details: for panels Hyprland misreads, and luminance the EDID gets
+  // wrong. Empty means Hyprland's default (from the EDID where it has one).
+  Section {
+    id: hdrSection
+    property bool open: view.hdrMode
+    visible: !!view.entry
+    title: "HDR DETAILS"
+    trailing: hdrSection.open ? "" : "SHOW"
+    foreground: view.fg
+    fontFamily: view.ff
+
+    Text {
+      visible: !hdrSection.open
+      width: parent.width
+      wrapMode: Text.WordWrap
+      textFormat: Text.PlainText
+      text: "Force HDR on a panel Hyprland misreads, set the SDR white level, override luminance… (click to show)"
+      color: view.dim
+      font.family: view.ff
+      font.pixelSize: Style.font.caption
+      MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: hdrSection.open = true }
+    }
+
+    Repeater {
+      model: hdrSection.open ? [
+        { key: "supportsHdr", label: "HDR support", kind: "force" },
+        { key: "supportsWideColor", label: "Wide colour support", kind: "force" }
+      ] : []
+      FieldRow {
+        required property var modelData
+        label: modelData.label
+        hint: "Force when the EDID is wrong"
+        foreground: view.fg
+        fontFamily: view.ff
+        ButtonGroup {
+          anchors.right: parent.right
+          options: [{ value: "", label: "Auto" }, { value: "0", label: "Off" }, { value: "1", label: "On" }]
+          value: view.entry && view.entry[modelData.key] !== null && view.entry[modelData.key] !== undefined && view.entry[modelData.key] >= 0
+                 ? String(view.entry[modelData.key]) : ""
+          foreground: view.fg
+          fontFamily: view.ff
+          fontSize: Style.font.caption
+          focusable: false
+          onChanged: function(v) { view.service.setHdrField(view.entry.name, modelData.key, v === "" ? null : Number(v)) }
+        }
+      }
+    }
+
+    Repeater {
+      model: hdrSection.open ? [
+        { key: "sdrMaxLuminance", label: "SDR white level", unit: "nits", hint: "203 is the BT.2408 reference", edid: 0 },
+        { key: "sdrMinLuminance", label: "SDR black level", unit: "nits", hint: "", edid: 0 },
+        { key: "maxLuminance", label: "Peak luminance", unit: "nits", hint: "EDID", edid: view.capsKnown ? view.caps.maxLuminance : 0 },
+        { key: "maxAvgLuminance", label: "Full-screen luminance", unit: "nits", hint: "EDID", edid: view.capsKnown ? view.caps.maxAvgLuminance : 0 },
+        { key: "minLuminance", label: "Black luminance", unit: "nits", hint: "EDID", edid: view.capsKnown ? view.caps.minLuminance : 0 }
+      ] : []
+      FieldRow {
+        id: lumRow
+        required property var modelData
+        readonly property var current: view.entry ? view.entry[modelData.key] : null
+        label: modelData.label
+        hint: (current !== null && current !== undefined ? "Set: " + current + " " + modelData.unit
+               : (modelData.edid ? "EDID says " + modelData.edid + " " + modelData.unit : "Default"))
+              + (modelData.hint && modelData.hint !== "EDID" ? " · " + modelData.hint : "")
+        foreground: view.fg
+        fontFamily: view.ff
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          TextField {
+            id: lumField
+            width: parent.width - lumSet.width - lumClear.width - parent.spacing * 2
+            placeholderText: lumRow.modelData.edid ? String(lumRow.modelData.edid) : "nits"
+            foreground: view.fg
+            onActiveFocusChanged: view.panel.textEditing = activeFocus
+            onAccepted: lumSet.clicked()
+            Keys.onEscapePressed: { text = ""; focus = false; view.panel.textEditing = false }
+          }
+          Button {
+            id: lumSet
+            text: "Set"
+            bordered: true
+            fontSize: Style.font.caption
+            foreground: view.fg
+            fontFamily: view.ff
+            onClicked: {
+              var t = lumField.text.trim() || (lumRow.modelData.edid ? String(lumRow.modelData.edid) : "")
+              if (!/^\d+(\.\d+)?$/.test(t)) { view.service.say("error", "Type a number of nits"); return }
+              view.service.setHdrField(view.entry.name, lumRow.modelData.key, Number(t))
+              lumField.text = ""
+              lumField.focus = false
+              view.panel.textEditing = false
+            }
+          }
+          PanelActionButton {
+            id: lumClear
+            iconText: "󰅖"
+            tooltipText: "Back to the default"
+            foreground: view.fg
+            onClicked: view.service.setHdrField(view.entry.name, lumRow.modelData.key, null)
+          }
+        }
+      }
+    }
+
+    FieldRow {
+      visible: hdrSection.open
+      label: "SDR transfer"
+      hint: "How SDR content is decoded in HDR"
+      foreground: view.fg
+      fontFamily: view.ff
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        foreground: view.fg
+        fontFamily: view.ff
+        value: view.entry ? view.entry.sdrEotf : ""
+        options: [{ value: "", label: "Default (no rule)" }, { value: "default", label: "Default" }, { value: "auto", label: "Auto" },
+                  { value: "srgb", label: "sRGB" }, { value: "gamma22", label: "Gamma 2.2" }, { value: "gamma22force", label: "Gamma 2.2 (forced)" }]
+        onChanged: function(v) { view.service.setSdrEotf(view.entry.name, v) }
+      }
+    }
+
+    // Calibrating by eye: a test pattern fullscreen, then what was seen.
+    Column {
+      visible: hdrSection.open && !!view.live && /^hdr/.test(view.live.cm)
+      width: parent.width
+      spacing: Style.space(6)
+      Text {
+        width: parent.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: view.service.calibrating
+          ? "Showing the " + view.service.calibrating + " pattern: look, then press q."
+          : "Calibrate by eye: each test fills the screen until you press q. Turn off the TV's own tone mapping and dynamic contrast first; if the control square at the bottom right shows, the TV is altering the picture."
+        color: view.dim
+        font.family: view.ff
+        font.pixelSize: Style.font.caption
+      }
+      Row {
+        spacing: Style.space(6)
+        Repeater {
+          model: [{ k: "peak", l: "Peak" }, { k: "full", l: "Full screen" }, { k: "black", l: "Black level" }]
+          Button {
+            required property var modelData
+            text: modelData.l
+            bordered: true
+            fontSize: Style.font.caption
+            foreground: view.fg
+            fontFamily: view.ff
+            onClicked: view.service.calibrate(modelData.k, view.entry.name)
+          }
+        }
+      }
+      Text {
+        visible: view.service.calibrated !== ""
+        width: parent.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: view.service.calibrated === "black"
+          ? "Which was the brightest square that still looked black?"
+          : "Which was the first square that vanished into its frame?"
+        color: view.fg
+        font.family: view.ff
+        font.pixelSize: Style.font.body
+      }
+      Flow {
+        visible: view.service.calibrated !== ""
+        width: parent.width
+        spacing: Style.space(4)
+        Repeater {
+          model: view.service.calibrated !== "" ? view.service.calibrationLevels : []
+          Button {
+            required property var modelData
+            text: String(modelData)
+            bordered: true
+            fontSize: Style.font.caption
+            horizontalPadding: Style.spacing.sm
+            foreground: view.fg
+            fontFamily: view.ff
+            onClicked: view.service.answerCalibration(view.entry.name, view.service.calibrated, modelData)
+          }
+        }
+      }
+    }
+
+    Row {
+      visible: hdrSection.open
+      anchors.right: parent.right
+      spacing: Style.space(8)
+      Button {
+        visible: !!view.live && /^hdr/.test(view.live.cm)
+        text: "Re-send HDR"
+        tooltipText: "For a panel that dropped out of HDR after sleep"
+        bordered: true
+        fontSize: Style.font.caption
+        foreground: view.fg
+        fontFamily: view.ff
+        onClicked: view.service.resendHdr()
+      }
+      Button {
+        text: "Apply"
+        bordered: true
+        active: view.service.dirty
+        foreground: view.fg
+        fontFamily: view.ff
+        onClicked: view.service.applyDraft()
+      }
+    }
+  }
+
   // Options for every display, applied and kept like the rest.
   Section {
     title: "ALL DISPLAYS"
@@ -256,7 +471,7 @@ Column {
           options: globalRow.modelData.type === "bool" ? [] : globalRow.modelData.values.map(function(v, i) {
             return { value: String(v), label: globalRow.modelData.labels[i] }
           })
-          onChanged: function(v) { view.service.setGlobal(globalRow.modelData.key, Number(v)) }
+          onChanged: function(v) { view.service.setGlobal(globalRow.modelData.key, globalRow.modelData.type === "string" ? v : Number(v)) }
         }
       }
     }
@@ -363,6 +578,27 @@ Column {
           { value: "0x1b", label: "USB-C" }, { value: "0x03", label: "DVI 1" }, { value: "0x01", label: "VGA" }
         ]
         onChanged: function(v) { view.service.setDdc(view.entry.name, "60", v) }
+      }
+    }
+
+    FieldRow {
+      visible: !!view.ddc && !!view.ddc.preset
+      label: "Colour preset (monitor)"
+      hint: "The monitor's own picture preset"
+      foreground: view.fg
+      fontFamily: view.ff
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        foreground: view.fg
+        fontFamily: view.ff
+        value: view.ddc ? String(view.ddc.preset || "").replace(/^x/, "0x") : ""
+        options: [
+          { value: "0x01", label: "sRGB" }, { value: "0x02", label: "Native" }, { value: "0x04", label: "5000 K" },
+          { value: "0x05", label: "6500 K" }, { value: "0x06", label: "7500 K" }, { value: "0x08", label: "9300 K" },
+          { value: "0x0b", label: "User 1" }, { value: "0x0c", label: "User 2" }, { value: "0x0d", label: "User 3" }
+        ]
+        onChanged: function(v) { view.service.setDdc(view.entry.name, "14", v) }
       }
     }
 

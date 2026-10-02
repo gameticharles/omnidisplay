@@ -386,10 +386,25 @@ Column {
 
   // --------------------------------------------------------------- tablet
 
-  property string tabletMode: "extend"
-  property string tabletSize: "1920x1200@60"
-  property string tabletSide: "right"
-  property string tabletAccess: "local"
+  // Opens with what was used last (kept in the profiles store).
+  readonly property var tabletPrefs: (service.prefs && service.prefs.tablet) || ({})
+  property string tabletMode: tabletPrefs.mode || "extend"
+  property string tabletSize: tabletPrefs.size || "1920x1200@60"
+  property string tabletSide: tabletPrefs.side || "right"
+  property string tabletAccess: tabletPrefs.access || "local"
+
+  function startTablet() {
+    service.setTabletPrefs({ mode: tabletMode, size: tabletSize, side: tabletSide, access: tabletAccess })
+    service.vncStart(tabletMode, tabletSize, tabletSide, tabletAccess)
+  }
+
+  function sizeFrom(text) {
+    var m = /^\s*(\d{3,4})\s*[x×]\s*(\d{3,4})(?:\s*@\s*(\d{2,3}))?\s*$/.exec(String(text || ""))
+    if (!m) return ""
+    var w = Number(m[1]), h = Number(m[2])
+    if (w < 320 || w > 7680 || h < 200 || h > 4320) return ""
+    return w + "x" + h + "@" + (m[3] || "60")
+  }
 
   Section {
     title: "TABLET OR PHONE AS A SCREEN"
@@ -457,6 +472,28 @@ Column {
       }
       FieldRow {
         visible: view.tabletMode === "extend"
+        label: "Custom size"
+        hint: "320×200 up to 7680×4320"
+        foreground: view.fg
+        fontFamily: view.ff
+        TextField {
+          width: parent.width
+          placeholderText: view.tabletSize
+          foreground: view.fg
+          onActiveFocusChanged: view.panel.textEditing = activeFocus
+          onAccepted: {
+            var size = view.sizeFrom(text)
+            if (!size) { view.service.say("error", "Type a size like 2560x1600"); return }
+            view.tabletSize = size
+            text = ""
+            focus = false
+            view.panel.textEditing = false
+          }
+          Keys.onEscapePressed: { text = ""; focus = false; view.panel.textEditing = false }
+        }
+      }
+      FieldRow {
+        visible: view.tabletMode === "extend"
         label: "Place it"
         foreground: view.fg
         fontFamily: view.ff
@@ -494,7 +531,7 @@ Column {
         active: true
         foreground: view.fg
         fontFamily: view.ff
-        onClicked: view.service.vncStart(view.tabletMode, view.tabletSize, view.tabletSide, view.tabletAccess)
+        onClicked: view.startTablet()
       }
     }
 
@@ -510,7 +547,7 @@ Column {
         text: {
           var s = view.vnc.session || {}
           var where = s.access === "network"
-            ? view.vnc.addresses.map(function(a) { return a.address + ":" + view.vnc.port + " (" + a.interface + ")" }).join(", ")
+            ? view.vnc.addresses.map(function(a) { return (a.kind || "") + " " + a.address + ":" + view.vnc.port + " (" + a.interface + ")" }).join(", ")
             : "127.0.0.1:" + view.vnc.port + " (SSH tunnel)"
           return (s.mode === "extend" ? "Serving the new screen " + (s.output || "") : "Serving " + (s.output || "this screen")) + " at " + where
         }
@@ -565,7 +602,7 @@ Column {
           }
           PanelActionButton {
             iconText: "󰑓"
-            tooltipText: "New password (takes effect on the next start)"
+            tooltipText: "New password (the running session restarts with it)"
             foreground: view.fg
             onClicked: view.service.vncRegenerate()
           }
@@ -597,6 +634,67 @@ Column {
         foreground: view.fg
         fontFamily: view.ff
         onClicked: view.service.vncStop()
+      }
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: view.vnc.listening ? "● Listening" : "○ Not listening yet: wayvnc may have failed to bind the port"
+        color: view.vnc.listening ? view.fg : Color.urgent
+        font.family: view.ff
+        font.pixelSize: Style.font.caption
+      }
+
+      FieldRow {
+        visible: (view.vnc.session || {}).access !== "network" && !!view.vnc.ssh
+        label: "From another computer"
+        hint: "Run this there, then connect its VNC client to localhost:" + view.vnc.port
+        labelRatio: 0.4
+        foreground: view.fg
+        fontFamily: view.ff
+        Row {
+          width: parent.width
+          spacing: Style.space(4)
+          Text {
+            width: parent.width - copySsh.width - parent.spacing
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: view.vnc.ssh || ""
+            color: view.fg
+            font.family: "monospace"
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+          PanelActionButton {
+            id: copySsh
+            iconText: "󰆏"
+            tooltipText: "Copy"
+            foreground: view.fg
+            onClicked: view.service.run(["wl-copy"], view.vnc.ssh)
+          }
+        }
+      }
+
+      FieldRow {
+        visible: (view.vnc.session || {}).mode === "extend"
+        label: "Change size"
+        foreground: view.fg
+        fontFamily: view.ff
+        TextField {
+          width: parent.width
+          placeholderText: (view.vnc.session || {}).size || ""
+          foreground: view.fg
+          onActiveFocusChanged: view.panel.textEditing = activeFocus
+          onAccepted: {
+            var size = view.sizeFrom(text)
+            if (!size) { view.service.say("error", "Type a size like 2560x1600"); return }
+            view.service.vncResize(size)
+            text = ""
+            focus = false
+            view.panel.textEditing = false
+          }
+          Keys.onEscapePressed: { text = ""; focus = false; view.panel.textEditing = false }
+        }
       }
     }
   }

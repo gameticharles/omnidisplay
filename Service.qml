@@ -8,6 +8,7 @@ import "lib/Lua.js" as Lua
 import "lib/Profiles.js" as Profiles
 import "lib/Plan.js" as Plan
 import "lib/Cast.js" as Cast
+import "lib/Menu.js" as Menu
 import "components"
 
 // OmniDisplay's one instance. Omarchy builds a bar, and so a widget, per
@@ -40,25 +41,37 @@ Item {
 
   property int confirmSeconds: 15
   property string persistMode: "block+service"
-  property bool autoProfiles: true
+  property bool autoProfilesSetting: true
+  // The Profiles tab's switch overrides the widget setting when used.
+  readonly property bool autoProfiles: store.prefs && store.prefs.autoProfiles !== undefined ? store.prefs.autoProfiles : autoProfilesSetting
+
+  function setAutoProfiles(on) {
+    var next = Object.assign({}, store.prefs || {})
+    next.autoProfiles = !!on
+    writeStore(Profiles.setPrefs(store, next))
+    if (on) scheduleRestore()
+  }
   property int backupsKept: 10
   property bool notifications: true
   property bool presentationAuto: false
   property bool useDdc: true
   property int snapThreshold: 48
   property bool identifyOnOpen: false
+  property int panelWidth: 600
 
   function applySettings(s) {
     function get(k, d) { return s && s[k] !== undefined && s[k] !== null ? s[k] : d }
     confirmSeconds = Math.max(5, Math.min(60, Number(get("confirmSeconds", 15)) || 15))
-    persistMode = get("persistMode", "block+service") === "service-only" ? "service-only" : "block+service"
-    autoProfiles = get("autoProfiles", true) !== false
+    var pm = get("persistMode", "block+service")
+    persistMode = pm === "service-only" || pm === "state-file" ? pm : "block+service"
+    autoProfilesSetting = get("autoProfiles", true) !== false
     backupsKept = Math.max(1, Math.min(50, Number(get("backupsKept", 10)) || 10))
     notifications = get("notifications", true) !== false
     presentationAuto = get("presentationMode", false) === true
     useDdc = get("ddc", true) !== false
     snapThreshold = Math.max(0, Math.min(400, Number(get("snapThreshold", 48)) || 0))
     identifyOnOpen = get("identifyOnOpen", false) === true
+    panelWidth = ({ compact: 480, comfortable: 600, wide: 720 })[get("panelWidth", "comfortable")] || 600
   }
 
   // ----------------------------------------------------------- live state
@@ -68,6 +81,15 @@ Item {
   property string fileText: ""
   property string fileState: "missing"
   property string fileSha: "-"
+  // Connectors the kernel reports plugged in. One Hyprland does not list at
+  // all has no usable signal (it failed to come up).
+  property var connectedPorts: []
+  readonly property var noSignal: connectedPorts.filter(function(p) { return !Model.entryByName(monitors, p) })
+
+  // The state-file save target (Omarchy's toggles folder), when used.
+  property string stateText: ""
+  property string stateState: "missing"
+  property string stateSha: "-"
   property bool loaded: false
   property var store: Profiles.emptyStore()
   property bool storeLoaded: false
@@ -85,11 +107,16 @@ Item {
     return monitors.length ? monitors[0] : null
   }
   readonly property int enabledCount: Model.enabledCount(monitors)
-  readonly property bool blockPresent: Lua.managedBlockText(fileText) !== ""
+  readonly property bool blockInMonitors: Lua.managedBlockText(fileText) !== ""
+  readonly property bool blockInState: stateState === "present" && Lua.managedBlockText(stateText) !== ""
+  readonly property bool blockPresent: persistMode === "state-file" ? blockInState : blockInMonitors
+  // Left over after switching where kept settings go.
+  readonly property bool staleMonitorsBlock: persistMode !== "block+service" && blockInMonitors
+  readonly property bool staleStateFile: persistMode !== "state-file" && stateState === "present"
   // The block went missing (`omarchy refresh hyprland` resets monitors.lua)
   // while a profile is in force: offered back in the panel.
   property bool blockNoticeDismissed: false
-  readonly property bool blockMissing: loaded && persistMode === "block+service" && !!activeProfile
+  readonly property bool blockMissing: loaded && persistMode !== "service-only" && !!activeProfile
                                        && (fileState === "present" || fileState === "missing") && !blockPresent
                                        && !blockNoticeDismissed
   readonly property var nearestProfile: activeProfile ? null : Profiles.nearestProfile(store, monitors)
@@ -128,6 +155,7 @@ Item {
   property int qrRevision: 0
   property var backups: []
   property var edidCaps: ({})
+  property var edidModes: ({})
   property var ddcBuses: ({})
   property var ddcValues: ({})
   property bool ddcDetected: false
@@ -189,6 +217,19 @@ Item {
       fileState = nl1 >= 0 ? file.substring(0, nl1) : "unreadable"
       fileSha = nl2 >= 0 ? file.substring(nl1 + 1, nl2) : "-"
       fileText = nl2 >= 0 ? file.substring(nl2 + 1) : ""
+      var st = String(parts[3] || "")
+      var s1 = st.indexOf("\n")
+      var s2 = s1 >= 0 ? st.indexOf("\n", s1 + 1) : -1
+      stateState = s1 >= 0 ? st.substring(0, s1) : "missing"
+      stateSha = s2 >= 0 ? st.substring(s1 + 1, s2) : "-"
+      stateText = s2 >= 0 ? st.substring(s2 + 1) : ""
+      for (var mi = 0; mi < monitors.length; mi++) loadEdid(monitors[mi].name)
+      var conn = []
+      String(parts[4] || "").split("\n").forEach(function(line) {
+        var p2 = line.split(" ")
+        if (p2.length === 2 && p2[1] === "connected" && !/^Writeback/.test(p2[0])) conn.push(p2[0])
+      })
+      connectedPorts = conn
       loaded = true
       if (phase === "" && (!dirtyByUser || draft.length === 0)) resetDraft()
       else reconcileDraft()
@@ -210,20 +251,20 @@ Item {
     var profile = activeProfile
     if (!profile) return out
     var ids = Model.identityKeys(out)
+    var keys = Lua.REQUEST_KEYS.concat(["icc", "modeKeyword", "positionAuto"])
     for (var i = 0; i < out.length; i++) {
       var s = profile.settings[ids[out[i].name]]
       if (!s) continue
-      out[i].vrr = s.vrr
-      out[i].bitdepth = s.bitdepth
-      out[i].cmSet = s.cmSet
-      out[i].sdrbrightness = s.sdrbrightness
-      out[i].sdrsaturation = s.sdrsaturation
+      for (var k = 0; k < keys.length; k++) if (s[keys[k]] !== undefined) out[i][keys[k]] = s[keys[k]]
     }
     return out
   }
 
+  // The live displays with the modes their EDIDs add, and the requests from
+  // the active profile: what every draft and plan starts from.
   function liveBase() {
-    return withProfileRequests(monitors)
+    var withEdid = monitors.map(function(m) { return Model.withEdidModes(m, edidModes[m.name]) })
+    return withProfileRequests(withEdid)
   }
 
   function resetDraft() {
@@ -288,23 +329,59 @@ Item {
       e.width = Number(width)
       e.height = Number(height)
       e.refresh = Model.nearestRefresh(rates, e.refresh)
+      e.modeline = Model.modelineFor(e, e.width, e.height, e.refresh)
+      e.customMode = false
+      e.modeKeyword = ""
       var clean = Model.cleanScale(e.scale, e.width, e.height)
       if (clean > 0) e.scale = clean
     })
   }
 
   function setRefresh(name, refresh) {
-    editEntry(name, function(e) { if (Model.hasMode(e, e.width, e.height, Number(refresh))) e.refresh = Number(refresh) })
+    editEntry(name, function(e) {
+      if (!Model.hasMode(e, e.width, e.height, Number(refresh))) return
+      e.refresh = Number(refresh)
+      e.modeline = Model.modelineFor(e, e.width, e.height, e.refresh)
+      e.modeKeyword = ""
+    })
   }
 
   function setMode(name, width, height, refresh) {
     editEntry(name, function(e) {
       if (!Model.hasMode(e, width, height, refresh)) return
       e.width = Number(width); e.height = Number(height); e.refresh = Number(refresh)
+      e.modeline = Model.modelineFor(e, e.width, e.height, e.refresh)
+      e.customMode = false
+      e.modeKeyword = ""
       var clean = Model.cleanScale(e.scale, e.width, e.height)
       if (clean > 0) e.scale = clean
     })
   }
+
+  // preferred, highres or highrr: Hyprland picks the mode. "" for exact.
+  function setModeKeyword(name, keyword) {
+    editEntry(name, function(e) { e.modeKeyword = ["preferred", "highres", "highrr"].indexOf(keyword) >= 0 ? keyword : "" })
+  }
+
+  // auto, auto-right, ...: Hyprland places the display. "" for the canvas.
+  function setPositionAuto(name, value) {
+    editEntry(name, function(e) {
+      e.positionAuto = ["auto", "auto-right", "auto-left", "auto-up", "auto-down"].indexOf(value) >= 0 ? value : ""
+    })
+  }
+
+  // One HDR detail (Lua.HDR_FIELDS key); null clears it.
+  function setHdrField(name, key, value) {
+    editEntry(name, function(e) {
+      for (var i = 0; i < Lua.HDR_FIELDS.length; i++) {
+        var f = Lua.HDR_FIELDS[i]
+        if (f.key !== key) continue
+        e[key] = value === null || value === undefined || value === "" ? null : (Lua.hdrValueOk(f, Number(value)) ? Number(value) : e[key])
+      }
+    })
+  }
+
+  function setSdrEotf(name, v) { editEntry(name, function(e) { e.sdrEotf = Lua.SDR_EOTFS.indexOf(v) >= 0 ? v : "" }) }
 
   function setScale(name, scale) {
     editEntry(name, function(e) { var c = Model.cleanScale(scale, e.width, e.height); if (c > 0) e.scale = c })
@@ -312,11 +389,35 @@ Item {
 
   function setTransform(name, t) { editEntry(name, function(e) { e.transform = Math.max(0, Math.min(7, Number(t) || 0)) }) }
   function setEnabled(name, on) { editEntry(name, function(e) { e.enabled = !!on; if (on) e.mirror = e.mirror || "" }) }
-  function setMirror(name, target) { editEntry(name, function(e) { e.mirror = target && target !== name ? String(target) : "" }) }
+  // Mirroring shows the target's picture: the mirroring display takes a mode
+  // both offer (the largest they share), so it is not scaled to a mode it
+  // cannot show crisply.
+  function setMirror(name, target) {
+    var src = target && target !== name ? Model.entryByName(draft, target) : null
+    editEntry(name, function(e) {
+      e.mirror = src ? String(target) : ""
+      if (!src) return
+      var c = Model.commonMode(src, e)
+      if (c && Model.hasMode(e, c.width, c.height, c.refreshB)) {
+        e.width = c.width; e.height = c.height; e.refresh = c.refreshB
+        e.modeline = Model.modelineFor(e, e.width, e.height, e.refresh)
+        e.modeKeyword = ""
+        var clean = Model.cleanScale(e.scale, e.width, e.height)
+        e.scale = clean > 0 ? clean : 1
+      }
+    })
+  }
   function setIcc(name, path) { editEntry(name, function(e) { e.icc = String(path || "").trim() }) }
   function setVrr(name, v) { editEntry(name, function(e) { e.vrr = Number(v) }) }
   function setBitdepth(name, b) { editEntry(name, function(e) { e.bitdepth = Number(b) === 10 ? 10 : Number(b) === 8 ? 8 : 0 }) }
-  function setCm(name, cm) { editEntry(name, function(e) { e.cmSet = String(cm || "") }) }
+  function setCm(name, cm) {
+    editEntry(name, function(e) {
+      e.cmSet = String(cm || "")
+      // Hyprland's default SDR white level (80 nits) looks dim in HDR; start
+      // at the BT.2408 reference, as Windows and Vista do.
+      if (/^hdr/.test(e.cmSet) && (e.sdrMaxLuminance === null || e.sdrMaxLuminance === undefined)) e.sdrMaxLuminance = 203
+    })
+  }
   function setSdr(name, brightness, saturation) {
     editEntry(name, function(e) {
       if (brightness !== undefined) e.sdrbrightness = Number(brightness) || 0
@@ -385,14 +486,28 @@ Item {
 
   // ================================================================ plans
 
+  // The store as it will be once this draft is kept: its profile updated and
+  // its monitors remembered. The saved block is written from it.
+  function futureStore(nextDraft, o) {
+    var now = Math.round(Date.now() / 1000)
+    var next = Profiles.upsertProfile(store, nextDraft, {
+      workspaces: o.workspaces || null,
+      laptop: o.laptopMode || Profiles.currentLaptopMode(nextDraft) || ""
+    }, now).store
+    next = Profiles.rememberMonitors(next, nextDraft, now)
+    if (o.globals) next = Profiles.setGlobals(next, o.globals)
+    return next
+  }
+
   function planFor(nextDraft, opts) {
     var o = opts || {}
     return Plan.buildPlan({
+      store: persistMode !== "service-only" ? futureStore(nextDraft, o) : null,
       snapshot: monitors,
       draft: nextDraft,
       fileText: fileText,
       fileState: fileState,
-      persist: persistMode === "block+service",
+      persist: persistMode !== "service-only",
       workspaces: o.workspaces || null,
       liveWorkspaces: workspaces,
       laptopMode: o.laptopMode || "",
@@ -462,8 +577,17 @@ Item {
     })
   }
 
+  // Each laptop mode keeps its own arrangement in the profile in force;
+  // switching mode brings that one back when there is one.
   function laptopModeNow(mode) {
     if (!hasLaptopChoice) { say("error", "Connect an external display to choose what the laptop screen does"); return false }
+    var p = activeProfile
+    if (p && p.variants && p.variants[mode]) {
+      var build = function() {
+        return planFor(Profiles.variantDraft(liveBase(), p, mode), { workspaces: p.workspaces, laptopMode: mode, note: p.name })
+      }
+      return applyPlan(build(), { workspaces: p.workspaces, laptop: mode, profileId: p.id }, build)
+    }
     return applyNow(null, { laptopMode: mode })
   }
 
@@ -601,9 +725,10 @@ Item {
     countdown.stop()
     phase = "keeping"
     var plan = pendingPlan
-    var writeFile = saveFile !== false && plan.canPersist
-    var text = writeFile ? plan.fileText : ""
-    run([ctl, "keep", token, writeFile ? fileSha : "-", String(backupsKept)], text, function(code, out) {
+    var toState = persistMode === "state-file"
+    var writeFile = saveFile !== false && persistMode !== "service-only" && (toState ? !!plan.block : plan.canPersist)
+    var text = writeFile ? (toState ? plan.block + "\n" : plan.fileText) : ""
+    run([ctl, "keep", token, writeFile ? (toState ? stateSha : fileSha) : "-", String(backupsKept), toState ? "state" : "monitors"], text, function(code, out) {
       if (code !== 0) {
         keepFailed = true
         phase = "confirm"
@@ -613,11 +738,12 @@ Item {
         return
       }
       saveProfileFrom(plan.draft, pendingExtra)
+      if (pendingExtra.profileId) runPostApply(Profiles.profileById(store, pendingExtra.profileId))
       phase = ""
       pendingPlan = null
       dirtyByUser = false
       draftLaptopMode = ""
-      say("info", writeFile ? "Kept and saved to monitors.lua" : "Kept")
+      say("info", writeFile ? (toState ? "Kept and saved to Omarchy's toggles folder" : "Kept and saved to monitors.lua") : "Kept")
       refresh()
       readOptions()
     })
@@ -690,10 +816,12 @@ Item {
   function saveProfileFrom(list, extra) {
     var x = extra || {}
     var result = Profiles.upsertProfile(store, list, {
+      id: x.profileId || "",
       workspaces: x.workspaces || null,
       laptop: x.laptop || Profiles.currentLaptopMode(list) || ""
     }, Math.round(Date.now() / 1000))
-    writeStore(x.globals ? Profiles.setGlobals(result.store, x.globals) : result.store)
+    var next = Profiles.rememberMonitors(result.store, list, Math.round(Date.now() / 1000))
+    writeStore(x.globals ? Profiles.setGlobals(next, x.globals) : next)
   }
 
   function saveCurrentAsProfile(name) {
@@ -708,15 +836,70 @@ Item {
 
   // Applies a saved profile through the countdown (only the one for the
   // displays connected now can be applied).
+  // Any profile for the connected set: applied through the countdown, and
+  // in force once kept (several can exist for one set).
+  readonly property var profilesHere: Profiles.profilesFor(store, monitors)
+
   function applyProfile(id) {
     var p = Profiles.profileById(store, id)
     if (!p) return false
-    if (!activeProfile || activeProfile.id !== p.id) { say("error", "\"" + p.name + "\" is for other displays than the ones connected"); return false }
+    if (!profilesHere.some(function(x) { return x.id === p.id })) { say("error", "\"" + p.name + "\" is for other displays than the ones connected"); return false }
     var build = function() {
-      return planFor(Profiles.draftFromProfile(monitors, p),
+      return planFor(Profiles.draftFromProfile(liveBase(), p),
                      { workspaces: p.workspaces, laptopMode: p.laptop !== Profiles.currentLaptopMode(monitors) ? p.laptop : "", note: p.name })
     }
-    return applyPlan(build(), { workspaces: p.workspaces, laptop: p.laptop }, build)
+    var started = applyPlan(build(), { workspaces: p.workspaces, laptop: p.laptop, profileId: p.id }, build)
+    // Nothing to change: it is the same layout, so selecting is enough.
+    if (!started && phase === "") writeStore(Profiles.selectProfile(store, p.id, Math.round(Date.now() / 1000)))
+    return started
+  }
+
+  function duplicateProfile(id) {
+    var r = Profiles.duplicateProfile(store, id, Math.round(Date.now() / 1000))
+    if (r.profile) { writeStore(r.store); say("info", "\"" + r.profile.name + "\" is now in force; rename it to tell them apart") }
+  }
+
+  function setProfileAnchor(id, identity) { writeStore(Profiles.setProfileField(store, id, "anchor", identity)) }
+  function setProfilePostApply(id, cmd) { writeStore(Profiles.setProfileField(store, id, "postApply", cmd)) }
+
+  // The user's own command for a profile, run after it is applied.
+  function runPostApply(profile) {
+    if (!profile || !profile.postApply) return
+    Quickshell.execDetached(["bash", "-lc", profile.postApply])
+  }
+
+  // ------------------------------------------------- per-field reset
+
+  // The value a draft field had when the draft was made (live, with the
+  // profile's requests): what its reset button goes back to.
+  function baseValue(name, key) {
+    var b = Model.entryByName(liveBase(), name)
+    return b ? b[key] : undefined
+  }
+
+  function fieldChanged(name, keys) {
+    var e = Model.entryByName(draft, name)
+    var b = Model.entryByName(liveBase(), name)
+    if (!e || !b) return false
+    for (var i = 0; i < keys.length; i++) if (JSON.stringify(e[keys[i]]) !== JSON.stringify(b[keys[i]])) return true
+    return false
+  }
+
+  // Puts fields of one display back, through the same reflow as an edit.
+  function resetFields(name, keys) {
+    var b = Model.entryByName(liveBase(), name)
+    if (!b) return
+    editEntry(name, function(e) { for (var i = 0; i < keys.length; i++) e[keys[i]] = b[keys[i]] })
+  }
+
+  function setPosition(name, x, y) {
+    var after = Model.cloneList(draft)
+    var e = Model.entryByName(after, name)
+    if (!e) return
+    e.x = Math.round(Number(x)) || 0
+    e.y = Math.round(Number(y)) || 0
+    e.positionAuto = ""
+    setDraft(after)
   }
 
   // ------------------------------------------------- restore on hotplug
@@ -739,17 +922,19 @@ Item {
   function autoRestore() {
     if (!autoProfiles || phase !== "" || !storeLoaded) return
     var profile = activeProfile
-    if (!profile) return
-    var key = profile.id + ":" + Profiles.connectedKey(monitors).join("|")
+    var base = liveBase()
+    var memoryDraft = profile ? null : Profiles.draftFromMemory(base, store)
+    if (!profile && !memoryDraft) return
+    var key = (profile ? profile.id : "memory") + ":" + Profiles.connectedKey(monitors).join("|")
     var now = Date.now()
     if (key === _lastRestoreKey && now - _lastRestoreMs < 30000) {
       if (_restoreCount >= 2) return
     } else {
       _restoreCount = 0
     }
-    var want = Profiles.draftFromProfile(monitors, profile)
-    var laptop = profile.laptop && hasLaptopChoice && profile.laptop !== laptopMode ? profile.laptop : ""
-    var plan = Plan.buildPlan({ snapshot: monitors, base: liveBase(), draft: want, persist: false, workspaces: profile.workspaces,
+    var want = profile ? Profiles.draftFromProfile(base, profile) : memoryDraft
+    var laptop = profile && profile.laptop && hasLaptopChoice && profile.laptop !== laptopMode ? profile.laptop : ""
+    var plan = Plan.buildPlan({ snapshot: monitors, base: base, draft: want, persist: false, workspaces: profile ? profile.workspaces : null,
                                 liveWorkspaces: workspaces, laptopMode: laptop,
                                 // Unknown live values would read as changes every time.
                                 globals: Object.keys(liveGlobals).length ? (store.globals || {}) : {},
@@ -760,8 +945,12 @@ Item {
     _lastRestoreKey = key
     _lastRestoreMs = now
     _restoreCount++
+    var label = profile ? "\"" + profile.name + "\"" : "remembered settings"
     run([ctl, "eval-rules"], geometryChanged ? plan.applyLua : "", function(code, out) {
-      if (code !== 0) { say("error", "Restoring \"" + profile.name + "\" failed: " + String(out).split("\n")[0]); return }
+      if (code !== 0) { say("error", "Restoring " + label + " failed: " + String(out).split("\n")[0]); return }
+      if (profile) runPostApply(profile)
+      offerUndo(profile ? "Restored " + profile.name : "Restored remembered display settings",
+                plan.changes.map(function(c) { return c.name + ": " + c.changes.join(", ") }).join("; "), plan)
       if (plan.applyLater) {
         laterTimer.later = plan.applyLater
         laterTimer.restart()
@@ -769,6 +958,28 @@ Item {
       for (var i = 0; i < plan.commands.length; i++) Quickshell.execDetached(plan.commands[i])
       if (plan.moves.length) run([ctl, "workspace-moves"], JSON.stringify(plan.moves))
       settleRefresh.restart()
+    })
+  }
+
+  // A silent restore says what it did, with Undo: the layout from before the
+  // restore comes back (by snapshot rules, as a revert does).
+  property var _undoRunner: null
+
+  function offerUndo(title, body, plan) {
+    if (!notifications) return
+    if (_undoRunner) { try { _undoRunner.signal(15) } catch (e) {} }
+    _undoRunner = run(["notify-send", "-a", "OmniDisplay", "-i", "video-display", "-A", "undo=Undo", "-w", title, body],
+                      undefined, function(code, out) {
+      _undoRunner = null
+      if (String(out || "").trim() !== "undo" || phase !== "") return
+      run([ctl, "eval-rules"], plan.revertLua, function() {
+        if (plan.revertLater) {
+          laterTimer.later = plan.revertLater
+          laterTimer.restart()
+        }
+        say("info", "Undid the automatic restore")
+        settleRefresh.restart()
+      })
     })
   }
 
@@ -791,6 +1002,26 @@ Item {
     return Plan.draftChanges(monitors, want).filter(function(c) { return c.name !== "Laptop" && c.name !== "Global" })
   }
   property bool driftDismissed: false
+
+  // Per display, how it runs differently from the profile in force, for the
+  // card on the canvas: "Running at 60 Hz, saved 144 Hz".
+  readonly property var displayNotes: {
+    var out = {}
+    if (!loaded || !activeProfile || phase !== "") return out
+    var want = Profiles.draftFromProfile(monitors, activeProfile)
+    for (var i = 0; i < monitors.length; i++) {
+      var m = monitors[i]
+      var w = Model.entryByName(want, m.name)
+      if (!w || m.enabled === false || w.enabled === false) continue
+      if (m.width !== w.width || m.height !== w.height)
+        out[m.name] = "Running at " + m.width + "×" + m.height + ", saved " + w.width + "×" + w.height
+      else if (Math.abs(m.refresh - w.refresh) > 0.6)
+        out[m.name] = "Running at " + Model.formatRefresh(m.refresh) + " Hz, saved " + Model.formatRefresh(w.refresh) + " Hz"
+      else if (!Model.sameScale(m.scale, w.scale))
+        out[m.name] = "Running at " + Model.normalizeScale(m.scale) + "x, saved " + Model.normalizeScale(w.scale) + "x"
+    }
+    return out
+  }
   onActiveProfileChanged: driftDismissed = false
 
   function restoreProfileNow() {
@@ -816,15 +1047,17 @@ Item {
       case "monitoraddedv2":
       case "monitorremoved":
       case "monitorremovedv2":
+        // Another monitor can come up on the same connector.
+        root.edidCaps = ({})
+        root.edidModes = ({})
+        // fall through
       case "configreloaded":
         if (root.phase === "") root.scheduleRestore()
         else if (root.phase === "confirm" || root.phase === "applying") {
-          // A display came or went in the middle of a change: the snapshot
-          // no longer describes this set of displays. Take the change back.
-          var before = Profiles.connectedKey(root.pendingSnapshot.length ? root.pendingSnapshot : root.monitors).join("|")
+          var before0 = Profiles.connectedKey(root.pendingSnapshot.length ? root.pendingSnapshot : root.monitors).join("|")
           root.refresh(function() {
             if ((root.phase === "confirm" || root.phase === "applying")
-                && Profiles.connectedKey(root.monitors).join("|") !== before) {
+                && Profiles.connectedKey(root.monitors).join("|") !== before0) {
               root.say("error", "A display was connected or removed during the change, so it was reverted")
               root.revert()
             }
@@ -918,6 +1151,11 @@ Item {
       var text = String(out || "").trim()
       next[name] = text === "no-edid" || text === "edid-decode-missing" || text === "" ? { missing: text } : Model.parseEdid(text)
       edidCaps = next
+      var modes = Object.assign({}, edidModes)
+      modes[name] = next[name].missing !== undefined ? [] : Model.parseModelines(text)
+      edidModes = modes
+      if (phase === "" && !dirtyByUser) resetDraft()
+      else reconcileDraft()
     })
   }
 
@@ -1211,7 +1449,13 @@ Item {
     run([ctl, "options"], undefined, function(code, out) {
       try { liveGlobals = JSON.parse(out) } catch (e) {}
     })
+    run(["hyprctl", "getoption", "animations:enabled", "-j"], undefined, function(code, out) {
+      try { var o = JSON.parse(out); animationsEnabled = (o.int !== undefined ? o.int : o.bool) ? true : false } catch (e) {}
+    })
   }
+
+  // Hyprland's own animations switch: the canvas does not glide when it is off.
+  property bool animationsEnabled: true
 
   // ======================================================== cast a window
 
@@ -1272,6 +1516,14 @@ Item {
     if (phase !== "") return
     var plan = planFor(liveBase(), { globals: store.globals || {} })
     if (!plan.ok) { say("error", plan.errors.length ? plan.errors[0].message : "Cannot build the block"); return }
+    if (persistMode === "state-file") {
+      run([ctl, "keep", "block" + Date.now(), stateSha, String(backupsKept), "state"], plan.block + "\n", function(code, out) {
+        if (code !== 0) say("error", "Could not write the state file: " + String(out).trim())
+        else say("info", "OmniDisplay's file in Omarchy's toggles folder is written")
+        refresh()
+      })
+      return
+    }
     var upsert = Lua.upsertManagedBlock(fileState === "present" ? fileText : "", plan.block)
     if (!upsert.ok) { say("error", upsert.error); return }
     run([ctl, "keep", "block" + Date.now(), fileSha, String(backupsKept)], upsert.text, function(code, out) {
@@ -1279,6 +1531,80 @@ Item {
       else say("info", "OmniDisplay's block is back in monitors.lua")
       refresh()
     })
+  }
+
+  // After switching where kept settings go: drop what the other place holds.
+  function removeMonitorsBlock() {
+    if (phase !== "" || fileState !== "present") return
+    var removed = Lua.removeManagedBlock(fileText)
+    if (!removed.ok) { say("error", removed.error); return }
+    run([ctl, "keep", "unblock" + Date.now(), fileSha, String(backupsKept)], removed.text, function(code, out) {
+      if (code !== 0) say("error", "Could not remove the block: " + String(out).trim())
+      else say("info", "Removed OmniDisplay's block from monitors.lua (a backup was kept)")
+      refresh()
+    })
+  }
+
+  function removeStateFile() {
+    run([ctl, "state-remove"], undefined, function() {
+      say("info", "Removed OmniDisplay's file from Omarchy's toggles folder")
+      refresh()
+    })
+  }
+
+  // ================================================== brightness in HDR
+
+  // In HDR the panel ignores its backlight: what changes how bright the
+  // desktop looks is SDR brightness. Applied at once (no countdown, like
+  // the backlight), and kept in the active profile.
+  function inHdr(m) { return !!m && m.enabled !== false && /^hdr/.test(m.cm) }
+
+  function setSdrBrightnessNow(name, value) {
+    var v = Math.max(0.5, Math.min(2, Model.roundTo(Number(value) || 1, 2)))
+    if (!Model.SAFE_NAME.test(name)) return v
+    run([ctl, "eval-rules"], "hl.monitor({ output = \"" + name + "\", sdrbrightness = " + v + " })")
+    var next = Model.cloneList(monitors)
+    var e = Model.entryByName(next, name)
+    if (e) { e.sdrBrightness = v; monitors = next }
+    _sdrPending = { name: name, value: v }
+    sdrSave.restart()
+    return v
+  }
+  property var _sdrPending: null
+
+  Timer {
+    id: sdrSave
+    interval: 900
+    onTriggered: {
+      var p = root._sdrPending
+      if (!p || !root.activeProfile) return
+      var next = Profiles.copyStore(root.store)
+      var prof = Profiles.profileById(next, root.activeProfile.id)
+      var ids = Model.identityKeys(root.monitors)
+      if (prof && prof.settings[ids[p.name]]) {
+        prof.settings[ids[p.name]].sdrbrightness = p.value
+        root.writeStore(next)
+      }
+    }
+  }
+
+  // What a brightness key runs: "+5%", "5%-" or "40%". HDR displays step
+  // SDR brightness; the rest go through Omarchy's own brightness command,
+  // which shows its OSD.
+  function brightnessStep(arg) {
+    var a = String(arg || "").trim()
+    if (!/^(\+\d{1,3}%|\d{1,3}%-|\d{1,3}%)$/.test(a)) return "use +5%, 5%- or 40%"
+    var m = focusedMonitor
+    if (inHdr(m)) {
+      var cur = Number(m.sdrBrightness) || 1
+      var n = parseInt(a.replace(/[^0-9]/g, ""), 10)
+      var v = a.charAt(0) === "+" ? cur + n / 100 : (/-$/.test(a) ? cur - n / 100 : 0.5 + 1.5 * n / 100)
+      v = setSdrBrightnessNow(m.name, v)
+      Quickshell.execDetached(["omarchy-osd", "-i", "brightness", "-p", String(Math.round((v - 0.5) / 1.5 * 100))])
+      return "sdr " + v
+    }
+    Quickshell.execDetached(["omarchy-brightness-display", a])
+    return "backlight " + a
   }
 
   // ============================================ start from nearest profile
@@ -1336,6 +1662,125 @@ Item {
     return count
   }
 
+  // ======================================================== layout health
+
+  readonly property var layoutIssues: loaded ? Plan.layoutHealth(monitors) : []
+
+  function repairLayout() {
+    var build = function() { return planFor(Plan.repairDraft(liveBase()), {}) }
+    return applyPlan(build(), {}, build)
+  }
+
+  // Everything read again from scratch: EDIDs, DDC buses, brightness.
+  function rescan() {
+    edidCaps = ({})
+    edidModes = ({})
+    ddcDetected = false
+    ddcBuses = ({})
+    _brightReadAt = ({})
+    refresh(function() { root.readAllBrightness() })
+    detectDdc()
+    loadBackups()
+    readOptions()
+    say("info", "Displays read again")
+  }
+
+  // While the panel is open the laptop backlight is re-read, so the slider
+  // follows the brightness keys (DDC is too slow for this; it is read on open).
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.panelsOpen > 0
+    onTriggered: {
+      for (var i = 0; i < root.monitors.length; i++)
+        if (root.monitors[i].internal && root.monitors[i].enabled !== false) root.readBrightness(root.monitors[i].name)
+    }
+  }
+
+  // ============================================================ menu row
+
+  property bool menuRowPresent: false
+
+  function readMenu(then) {
+    run([ctl, "menu", "read"], undefined, function(code, out) {
+      menuRowPresent = Menu.hasRow(out)
+      if (typeof then === "function") then(String(out || ""))
+    })
+  }
+
+  function setMenuRow(on) {
+    readMenu(function(text) {
+      var r = on ? Menu.addRow(text) : Menu.removeRow(text)
+      if (!r.ok) { say("error", r.error); return }
+      if (r.unchanged) return
+      run([ctl, "menu", "write"], r.text, function(code) {
+        if (code !== 0) say("error", "Could not write Omarchy's menu file")
+        else say("info", on ? "Added Setup › Displays to the Omarchy menu" : "Removed the Omarchy menu row")
+        readMenu()
+      })
+    })
+  }
+
+  // ===================================================== HDR calibration
+
+  // Shows a test pattern fullscreen (q closes it); the panel then asks what
+  // was seen, and the answer goes into the draft like any other change.
+  readonly property string hdrPattern: pluginDir + "/bin/omnidisplay-hdr-pattern"
+  property string calibrating: ""      // "", "peak", "full", "black" while a pattern shows
+  property string calibrated: ""       // the last pattern shown, waiting for an answer
+  property var calibrationLevels: []
+
+  function calibrate(kind, name) {
+    var e = Model.entryByName(monitors, name)
+    if (!e || !inHdr(e)) { say("error", "Switch the display to HDR first: the patterns need it"); return }
+    var caps = edidCaps[name]
+    var max = caps && caps.maxLuminance ? Math.max(400, Math.min(10000, caps.maxLuminance * 2)) : 4000
+    var png = runDir + "/hdr-" + kind + ".png"
+    calibrating = kind
+    run([hdrPattern, "levels", kind, String(max)], undefined, function(c, out) {
+      calibrationLevels = String(out || "").split("\n").filter(function(l) { return l !== "" }).map(Number)
+      run([hdrPattern, "draw", kind, String(max), png], undefined, function(code, o2, err) {
+        if (code !== 0) { calibrating = ""; say("error", String(err || o2).trim() || "Could not draw the pattern"); return }
+        run([hdrPattern, "show", png], undefined, function() {
+          calibrating = ""
+          calibrated = kind
+        })
+      })
+    })
+  }
+
+  function answerCalibration(name, kind, nits) {
+    var key = kind === "peak" ? "maxLuminance" : kind === "full" ? "maxAvgLuminance" : "minLuminance"
+    setHdrField(name, key, Number(nits))
+    calibrated = ""
+  }
+
+  // ================================================================ prefs
+
+  readonly property var prefs: store.prefs || ({})
+
+  function setTabletPrefs(t) {
+    var next = Object.assign({}, store.prefs || {})
+    next.tablet = t
+    writeStore(Profiles.setPrefs(store, next))
+  }
+
+  function vncResize(size) {
+    run([vncCtl, "resize", size], undefined, function(code, out, err) {
+      if (code !== 0) say("error", String(err || out).trim().split("\n").pop() || "Could not change the size")
+      readVnc()
+      refresh()
+    })
+  }
+
+  // ===================================================== full-screen editor
+
+  property bool fullArrangeOpen: false
+
+  FullArrange {
+    service: root
+  }
+
   // ======================================================= panel lifecycle
 
   function panelOpened() {
@@ -1347,6 +1792,7 @@ Item {
     readPresenting()
     detectDdc()
     for (var name in ddcBuses) readDdc(name)
+    readMenu()
     if (identifyOnOpen) identify()
   }
 
@@ -1374,6 +1820,12 @@ Item {
 
   IdentifyOverlay {
     id: identifyOverlay
+  }
+
+  function identifyOne(name) {
+    var n = displayNumber(name)
+    var e = Model.entryByName(monitors, name)
+    if (e) identifyOverlay.show([{ output: name, number: n || 1, label: Model.displayLabel(e) }])
   }
 
   function identify() {
@@ -1491,12 +1943,26 @@ Item {
       return root.applyPlan(build(), { globals: globals, workspaces: ws }, build) ? "applying" : "refused"
     }
     function options(): string { return JSON.stringify(root.liveGlobals) }
+    // Drafts a workspace plan (off, sequential, interleaved, manual) and
+    // returns it per display; Apply in the panel puts it into force.
+    function workspaces(strategy: string, count: string): string {
+      if (["off", "sequential", "interleaved", "manual"].indexOf(strategy) < 0) return "use off, sequential, interleaved or manual"
+      var next = Profiles.cleanWorkspaces(root.draftWorkspaces)
+      next.strategy = strategy
+      if (Number(count) > 0) next.count = Number(count)
+      root.setWorkspacePlan(next)
+      var byName = {}
+      Profiles.planWorkspaces(root.draft, root.draftWorkspaces).forEach(function(r) { (byName[r.name] = byName[r.name] || []).push(r.workspace) })
+      return Object.keys(byName).map(function(n) { return n + ": " + byName[n].join(",") }).join("; ") || "no rules"
+    }
+    function resetDraft(): void { root.resetDraft() }
     function keep(): string { root.keep(true); return root.phase }
     function revert(): string { root.revert(); return "reverting" }
     function emergency(): string { return root.emergency() }
     function messages(): string { return JSON.stringify(root.messages) }
     function clearMessages(): void { root.clearMessages() }
     function resendHdr(): string { return root.resendHdr() + " display(s)" }
+    function brightnessStep(arg: string): string { return root.brightnessStep(arg) }
     function writeBlock(): void { root.writeBlockNow() }
     function present(on: string): string { root.setPresenting(on === "on" || on === "true"); return on }
     function castStop(): void { root.castCommand(["disconnect", ""]) }
@@ -1506,6 +1972,10 @@ Item {
   IpcHandler {
     target: "omarchy.monitor"
 
+    // So a binding written for the built-in widget's replacements works here.
+    function revert(): string { root.revert(); return "reverting" }
+    function keep(): string { root.keep(true); return root.phase }
+    function emergency(): string { return root.emergency() }
     function open(): void { root.togglePanel() }
     function toggle(): void { root.togglePanel() }
     function show(): void { root.togglePanel() }

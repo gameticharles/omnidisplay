@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg: #0b0b0d;
+    --line: #28282c;
+    --text: #e3e2e2;
+    --muted: #9a9aa0;
+    --accent: #e68e0d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 2000px; height: 1400px; background: var(--bg); }
+  body {
+    font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace;
+    color: var(--text);
+    padding: 64px 70px 0;
+    background:
+      radial-gradient(1200px 520px at 78% -8%, rgba(230, 142, 13, 0.16), transparent 70%),
+      radial-gradient(900px 500px at 0% 105%, rgba(230, 142, 13, 0.07), transparent 70%),
+      var(--bg);
+  }
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 40px; }
+  .brand { display: flex; align-items: center; gap: 28px; }
+  .icon {
+    width: 104px; height: 104px; border: 3px solid var(--accent); border-radius: 18px;
+    display: grid; place-items: center; font-size: 62px; color: var(--accent);
+    background: rgba(230, 142, 13, 0.08);
+  }
+  h1 { font-size: 86px; font-weight: 800; letter-spacing: -2px; line-height: 1; }
+  h1 span { color: var(--accent); }
+  .tagline { margin-top: 14px; font-size: 30px; color: var(--muted); }
+  .pills { display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; max-width: 640px; }
+  .pill {
+    font-size: 21px; padding: 9px 16px; border: 1.5px solid var(--line);
+    color: var(--muted); border-radius: 6px; background: rgba(255, 255, 255, 0.02);
+  }
+  .pill.on { border-color: var(--accent); color: var(--accent); }
+
+  .shots { display: flex; gap: 30px; margin-top: 50px; }
+  figure { width: 600px; }
+  figcaption { display: flex; align-items: baseline; gap: 14px; margin-bottom: 14px; }
+  figcaption b { font-size: 25px; color: var(--accent); letter-spacing: 3px; }
+  figcaption span { font-size: 21px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  figure img {
+    display: block; width: 600px; height: 700px; object-fit: cover; object-position: top;
+    border-radius: 4px;
+    box-shadow: 0 30px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  }
+
+  .features {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px 40px;
+    margin-top: 44px; padding-top: 34px; border-top: 1.5px solid var(--line);
+  }
+  .f { display: flex; gap: 18px; align-items: flex-start; }
+  .f i { font-style: normal; font-size: 34px; color: var(--accent); flex: 0 0 46px; text-align: center; line-height: 1.15; }
+  .f b { display: block; font-size: 24px; margin-bottom: 5px; }
+  .f p { font-size: 19.5px; color: var(--muted); line-height: 1.4; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="icon">󰍹</div>
+      <div>
+        <h1>Omni<span>Display</span></h1>
+        <p class="tagline">Every display setting in one panel, with a safety net.</p>
+      </div>
+    </div>
+    <div class="pills">
+      <span class="pill on">Replaces the Display widget</span>
+      <span class="pill">Hyprland Lua config</span>
+      <span class="pill">Profiles from boot</span>
+      <span class="pill">HDR</span>
+      <span class="pill">DDC/CI</span>
+      <span class="pill">Miracast · AirPlay · VNC</span>
+    </div>
+  </header>
+
+  <section class="shots">
+    <figure>
+      <figcaption><b>ARRANGE</b><span>drag, mode, scale, rotation</span></figcaption>
+      <img src="arrange.png">
+    </figure>
+    <figure>
+      <figcaption><b>SPACES</b><span>workspaces planned per display</span></figcaption>
+      <img src="spaces.png">
+    </figure>
+    <figure>
+      <figcaption><b>COLOUR</b><span>HDR, 10-bit, SDR levels, ICC</span></figcaption>
+      <img src="colour.png">
+    </figure>
+  </section>
+
+  <section class="features">
+    <div class="f"><i>󰑓</i><div><b>Keep or revert</b><p>Every change waits for Keep and reverts by itself, even if the shell dies.</p></div></div>
+    <div class="f"><i>󰆓</i><div><b>A profile per desk</b><p>Matched by panel, applied from boot and on hotplug.</p></div></div>
+    <div class="f"><i>󰃟</i><div><b>Brightness everywhere</b><p>Laptop, Apple and DDC/CI monitors, HDR-aware.</p></div></div>
+    <div class="f"><i>󰐾</i><div><b>Cast and tablets</b><p>Miracast, AirPlay, or a tablet as a screen over VNC.</p></div></div>
+    <div class="f"><i>󰈙</i><div><b>Tidy config</b><p>One managed block in monitors.lua, with backups and restore.</p></div></div>
+    <div class="f"><i>󰌌</i><div><b>Keyboard first</b><p>h/l to choose, Enter to pick up, +/− to scale, a to apply.</p></div></div>
+  </section>
+</body>
+</html>

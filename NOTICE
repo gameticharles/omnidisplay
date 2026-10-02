@@ -40,3 +40,10 @@ Ideas, reimplemented without copying code: Vista (formerly Panorama, HDR
 and colour management, EDID capabilities), Better Displays Pro (native-mode
 insights, density-based scale suggestion), hyprmoncfg (profiles, workspace
 planner), Omarchy Virtual Display and Tablet Display (VNC screens).
+
+omarchy-hyprmoncfg, https://github.com/crmne/omarchy-hyprmoncfg
+  Copyright (c) crmne (Carmine Paolino)
+  Ideas, reimplemented: the arrangement drawn as lit screens on a dotted
+  stage, workspace chips that glide between displays when the plan changes,
+  the planner's monitor order and persistence, profile thumbnails with a
+  match score, per-field reset, Identify for one display.

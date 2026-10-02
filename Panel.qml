@@ -84,6 +84,8 @@ Panel {
     }
   }
 
+  property bool showKeys: false
+
   // Inline editors (rename, PIN entry) take the keyboard from the catcher.
   property bool textEditing: false
 
@@ -175,8 +177,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(480))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(680))
+    contentWidth: panel.fittedContentWidth(Style.space(root.service ? root.service.panelWidth : 600))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(760))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -201,6 +203,7 @@ Panel {
         if (t === "[") { root.cycleTab(-1); return }
         if (t === "]") { root.cycleTab(1); return }
         if (t === "i" && root.service) { root.service.identify(); return }
+        if (t === "?") { root.showKeys = !root.showKeys; return }
         var v = viewLoader.item
         if (v && typeof v.handleText === "function") v.handleText(t)
       }
@@ -453,6 +456,32 @@ Panel {
                 fontFamily: root.fontFamily
                 onClicked: root.service.keep(!root.service.keepFailed)
               }
+            }
+          }
+
+          // Keys, on ? (and off again).
+          Rectangle {
+            visible: root.showKeys
+            width: parent.width
+            height: keysText.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: Util.alpha(root.foreground, 0.05)
+            Text {
+              id: keysText
+              x: Style.space(8)
+              y: Style.space(8)
+              width: parent.width - Style.space(16)
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              text: "1–6 or [ ]  tabs        i  identify        ?  these keys        Esc  close\n"
+                  + "j k  scroll        Tab  next bar panel (Omarchy)\n"
+                  + "Arrange:  h l choose · Enter pick up / put down · h j k l move 100 px (H J K L 10 px)\n"
+                  + "          + - scale · o rotate · e on/off · a apply · r reset · p plan · f full screen\n"
+                  + "Colour, Spaces:  a apply · r reset\n"
+                  + "Keep card:  Enter revert (preselected) · K keep · Esc revert"
             }
           }
 

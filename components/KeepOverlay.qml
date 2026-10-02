@@ -132,6 +132,16 @@ Scope {
               }
             }
 
+            // The layout about to be kept.
+            MonitorCanvas {
+              visible: !!root.service.pendingPlan
+              width: parent.width
+              height: Style.space(110)
+              interactive: false
+              layout: root.service.pendingPlan ? root.service.pendingPlan.draft.filter(function(e) { return e.enabled !== false && !e.mirror && e.width > 0 }) : []
+              workspacePlan: root.service.pendingPlan ? root.service.pendingPlan.workspaceRules : []
+            }
+
             Rectangle {
               width: parent.width
               height: Math.max(3, Style.space(3))

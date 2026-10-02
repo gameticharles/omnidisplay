@@ -637,6 +637,121 @@ test("string global options are quoted and checked", () => {
   assert.ok(!Lua.evalLinesOk('hl.config({ cursor = { inactive_timeout = 5 } })'))
 })
 
+console.log("\nTier 3")
+
+test("several profiles for one set: the last used wins, duplicates start in force", () => {
+  let s = Profiles.upsertProfile(Profiles.emptyStore(), desk, { name: "Desk" }, 10).store
+  const desk1 = s.profiles[0]
+  const dup = Profiles.duplicateProfile(s, desk1.id, 20)
+  s = dup.store
+  assert.strictEqual(s.profiles.length, 2)
+  assert.strictEqual(Profiles.profileFor(s, desk).id, dup.profile.id)
+  s = Profiles.selectProfile(s, desk1.id, 30)
+  assert.strictEqual(Profiles.profileFor(s, desk).id, desk1.id)
+  // Keeping goes into the one in force, not a new one.
+  const edited = Model.cloneList(desk)
+  byName(edited, "DP-2").scale = 1.25
+  s = Profiles.upsertProfile(s, edited, null, 40).store
+  assert.strictEqual(s.profiles.length, 2)
+  assert.strictEqual(Profiles.profileById(s, desk1.id).settings["Dell Inc. DELL U2719D TESTDELL01"].scale, 1.25)
+  assert.strictEqual(Profiles.luaProfiles(s)[0].id, desk1.id)
+})
+
+test("each laptop mode keeps its own arrangement", () => {
+  let s = Profiles.upsertProfile(Profiles.emptyStore(), desk, { laptop: "extend" }, 1).store
+  const mirrored = Model.cloneList(desk)
+  byName(mirrored, "HDMI-A-1").scale = 2
+  s = Profiles.upsertProfile(s, mirrored, { laptop: "mirror" }, 2).store
+  const p = Profiles.profileFor(s, desk)
+  assert.deepStrictEqual(Object.keys(p.variants).sort(), ["extend", "mirror"])
+  assert.strictEqual(byName(Profiles.variantDraft(desk, p, "mirror"), "HDMI-A-1").scale, 2)
+  assert.strictEqual(byName(Profiles.variantDraft(desk, p, "extend"), "HDMI-A-1").scale, 1.5)
+  assert.strictEqual(Profiles.variantDraft(desk, p, "external-only"), null)
+})
+
+test("the anchor display is what the layout is measured from", () => {
+  let s = Profiles.upsertProfile(Profiles.emptyStore(), desk, null, 1).store
+  s = Profiles.setProfileField(s, s.profiles[0].id, "anchor", "Dell Inc. DELL U2719D TESTDELL01")
+  assert.strictEqual(Profiles.parseStore(Profiles.serializeStore(s)).profiles[0].anchor, "Dell Inc. DELL U2719D TESTDELL01")
+  assert.strictEqual(Profiles.setProfileField(s, s.profiles[0].id, "anchor", "nobody").profiles[0].anchor, "Dell Inc. DELL U2719D TESTDELL01")
+})
+
+test("mirroring picks a mode both displays offer", () => {
+  const c = Model.commonMode(byName(desk, "HDMI-A-1"), byName(desk, "DP-2"))
+  assert.ok(c && c.width === 2560 && c.height === 1440 || c && Model.hasMode(byName(desk, "DP-2"), c.width, c.height, c.refreshB))
+  const lap = Model.commonMode(byName(desk, "DP-2"), byName(desk, "eDP-1"))
+  assert.deepStrictEqual([lap.width, lap.height], [1920, 1080])
+})
+
+test("layout health: overlap, gap, broken mirror and origin, then repaired", () => {
+  const bad = Model.cloneList(desk)
+  byName(bad, "DP-2").x = 100
+  byName(bad, "HDMI-A-1").x = 20000
+  const issues = Plan.layoutHealth(bad).map(i => i.code)
+  assert.ok(issues.includes("overlap") && issues.includes("gap"))
+  const fixed = Plan.repairDraft(bad)
+  assert.deepStrictEqual(Plan.layoutHealth(fixed), [])
+  const mir = Model.cloneList(desk)
+  byName(mir, "DP-2").mirror = "HDMI-A-1"
+  byName(mir, "HDMI-A-1").enabled = false
+  assert.ok(Plan.layoutHealth(mir).some(i => i.code === "mirror"))
+  assert.strictEqual(byName(Plan.repairDraft(mir), "DP-2").mirror, "")
+  assert.deepStrictEqual(Plan.layoutHealth(desk), [])
+})
+
+const Menu = load("Menu.js")
+
+test("menu row: added and removed without touching anything else", () => {
+  const original = '{\n  // my rows\n  "setup.foo": { "label": "Foo", "action": "foo" }, /* keep */\n  "x": [1, 2,],\n}\n'
+  const added = Menu.addRow(original)
+  assert.ok(added.ok, added.error)
+  assert.ok(added.text.includes("// my rows") && added.text.includes("/* keep */"))
+  assert.ok(Menu.hasRow(added.text))
+  assert.ok(Menu.addRow(added.text).unchanged)
+  const removed = Menu.removeRow(added.text)
+  assert.ok(removed.ok, removed.error)
+  assert.ok(!Menu.hasRow(removed.text))
+  assert.deepStrictEqual(Menu.parse(removed.text), Menu.parse(original))
+  assert.ok(Menu.addRow("").ok)
+  assert.ok(Menu.addRow("{}").text.includes("setup.omnidisplay"))
+  assert.strictEqual(Menu.addRow("{ broken").ok, false)
+  assert.strictEqual(Menu.parse('{"a": "//not a comment"}').a, "//not a comment")
+})
+
+console.log("\nhyprmoncfg ideas")
+
+test("workspace monitor order, persistence and chip moves", () => {
+  const seq = { strategy: "sequential", count: 6 }
+  const plain = Profiles.planWorkspaces(desk, seq)
+  assert.deepStrictEqual(plain.filter(r => r.workspace === 1).map(r => r.name), ["eDP-1"])
+  const moved = Profiles.moveInOrder(desk, seq, "HDMI-A-1", -1)
+  const moved2 = Profiles.moveInOrder(desk, moved, "HDMI-A-1", -1)
+  const after = Profiles.planWorkspaces(desk, moved2)
+  assert.strictEqual(after.find(r => r.workspace === 1).name, "HDMI-A-1")
+  const moves = Profiles.chipMoves(plain, after)
+  assert.ok(moves.length > 0 && moves.every(m => m.from !== m.to))
+  const first = Profiles.planWorkspaces(desk, { strategy: "sequential", count: 6, persistence: "first" })
+  assert.deepStrictEqual(first.filter(r => r.persistent).map(r => r.workspace), [1, 3, 5])
+  assert.strictEqual(Profiles.cleanWorkspaces({ persistent: true }).persistence, "all")
+  assert.ok(/persistent = true/.test(Lua.workspaceRule({ workspace: 1, monitor: "DP-2", isDefault: true, persistent: true })))
+})
+
+test("match score and reasons", () => {
+  const s = Profiles.upsertProfile(Profiles.emptyStore(), desk, null, 1).store
+  const exact = Profiles.matchInfo(s.profiles[0], desk)
+  assert.strictEqual(exact.score, 300)
+  assert.ok(exact.exact && /3 displays connected/.test(exact.reasons[0]))
+  const partial = Profiles.matchInfo(s.profiles[0], laptop)
+  assert.ok(!partial.exact && partial.score >= 0 && partial.reasons.length === 2)
+})
+
+test("every sharp scale for a mode", () => {
+  const s = Model.sharpScales(1920, 1080)
+  assert.ok(s.includes(1) && s.includes(1.5) && s.includes(2) && s.includes(1.6))
+  assert.ok(s.every(v => Model.cleanScale(v, 1920, 1080) === v))
+  assert.strictEqual(Model.inchesLabel(byName(desk, "DP-2")), "27\"")
+})
+
 console.log("\nCast")
 
 test("cast state: one list, sessions win over peers", () => {

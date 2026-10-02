@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# omarchy:summary=HDR calibration patterns for OmniDisplay (PQ test images shown through mpv)
+# omarchy:group=omnidisplay
+#
+# Calibrating HDR by eye: a display's EDID states its peak, full-screen and
+# black luminance, and games and players trust those numbers; EDIDs are often
+# wrong or blank. Each pattern is a 16-bit PNG encoded in PQ (SMPTE ST 2084)
+# with BT.2020 primaries, shown fullscreen by mpv in HDR.
+#
+#   draw <peak|full|black> <max-nits> <out.png>   write the pattern
+#   show <png>                                    show it until q is pressed
+#   levels <peak|full|black> <max-nits>           the nit levels, one per line
+#
+# peak   squares of rising brightness, each inside a frame at the brightest
+#        level sent: the first square that vanishes into its frame is the peak
+# full   the same on a bright screen (a display may dim a bright screen)
+# black  near-black squares on black: the brightest that still looks black
+#
+# After Arash's Panorama/Vista calibration (MIT), reimplemented. See NOTICE.
+
+set -uo pipefail
+MARKER="__omnidisplay_exit="
+
+die() { printf '%s\n' "$*" >&2; exit 2; }
+
+# PQ code value (0-65535) for a luminance in nits.
+pq16() {
+  awk -v L="$1" 'BEGIN {
+    m1 = 0.1593017578125; m2 = 78.84375; c1 = 0.8359375; c2 = 18.8515625; c3 = 18.6875
+    y = L / 10000; if (y < 0) y = 0; if (y > 1) y = 1
+    p = y ^ m1
+    v = ((c1 + c2 * p) / (1 + c3 * p)) ^ m2
+    printf "%d\n", v * 65535 + 0.5
+  }'
+}
+
+levels() {
+  local kind="$1" max="$2" l
+  case "$kind" in
+    peak|full)
+      for l in 200 300 400 500 600 700 800 900 1000 1200 1400 1600 2000 2500 3000 4000; do
+        (( l < max )) && echo "$l"
+      done
+      ;;
+    black)
+      for l in 0.0005 0.001 0.002 0.003 0.005 0.0075 0.01 0.02 0.03 0.05 0.1 0.2; do echo "$l"; done
+      ;;
+  esac
+}
+
+# As a percentage, which ImageMagick keeps at 16-bit precision (rgb() with
+# plain numbers is read on a 0-255 scale).
+gray() { local v; v=$(awk -v c="$(pq16 "$1")" 'BEGIN { printf "%.4f", c / 65535 * 100 }'); printf 'rgb(%s%%,%s%%,%s%%)' "$v" "$v" "$v"; }
+
+cmd_draw() {
+  local kind="${1:-}" max="${2:-}" out="${3:-}"
+  [[ $kind =~ ^(peak|full|black)$ ]] || die "kind must be peak, full or black"
+  [[ $max =~ ^[0-9]{2,5}$ ]] && (( max >= 100 && max <= 10000 )) || die "max nits must be 100-10000"
+  [[ $out == "${XDG_RUNTIME_DIR:-/tmp}"/omnidisplay/*.png && $out != *..* ]] || die "the pattern goes in \$XDG_RUNTIME_DIR/omnidisplay"
+  command -v magick >/dev/null 2>&1 || die "ImageMagick (magick) is needed"
+  mkdir -p -m 700 -- "$(dirname -- "$out")"
+  local W=1920 H=1080
+  local bg frame label
+  case "$kind" in
+    peak) bg=$(gray 0); frame=$(gray "$max") ;;
+    full) bg=$(gray "$max"); frame=$(gray "$max") ;;
+    black) bg=$(gray 0); frame=$(gray 0) ;;
+  esac
+  label=$(gray 100)
+  local -a draw=()
+  local list i=0 n x y side=140 gap=50 cols=8 lvl
+  mapfile -t list < <(levels "$kind" "$max")
+  n=${#list[@]}
+  for lvl in "${list[@]}"; do
+    x=$(( 120 + (i % cols) * (side + gap + 40) ))
+    y=$(( 220 + (i / cols) * (side + gap + 120) ))
+    draw+=(-fill "$frame" -draw "rectangle $((x - 30)),$((y - 30)) $((x + side + 30)),$((y + side + 30))")
+    draw+=(-fill "$(gray "$lvl")" -draw "rectangle $x,$y $((x + side)),$((y + side))")
+    draw+=(-fill "$label" -pointsize 30 -annotate "+$((x + 10))+$((y + side + 75))" "$lvl")
+    i=$((i + 1))
+  done
+  # A control square identical to its surround: visible means the display is
+  # altering the picture (tone mapping, dynamic contrast).
+  draw+=(-fill "$frame" -draw "rectangle 1700,880 1840,1020")
+  draw+=(-fill "$label" -pointsize 34 -annotate "+120+120" "OmniDisplay HDR $kind test · press q when done")
+  magick -size "${W}x${H}" -depth 16 "xc:$bg" "${draw[@]}" -define png:color-type=2 "PNG48:$out" || die "magick failed"
+  printf '%s0\n' "$MARKER"
+}
+
+cmd_show() {
+  local png="${1:-}"
+  [[ -f $png && $png == "${XDG_RUNTIME_DIR:-/tmp}"/omnidisplay/*.png ]] || die "no such pattern"
+  command -v mpv >/dev/null 2>&1 || die "mpv is needed"
+  # The PNG carries PQ values with BT.2020 primaries; tell mpv so, and let
+  # gpu-next hand the compositor HDR.
+  mpv --no-config --fs --title=omnidisplay-hdr-pattern --image-display-duration=inf --no-osc --osd-level=0 \
+      --vo=gpu-next --target-colorspace-hint=yes \
+      --vf=format=gamma=pq:primaries=bt.2020 -- "$png" >/dev/null 2>&1
+  printf '%s%s\n' "$MARKER" "$?"
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  draw) cmd_draw "$@" ;;
+  show) cmd_show "$@" ;;
+  levels) levels "${1:-peak}" "${2:-4000}" ;;
+  *) sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

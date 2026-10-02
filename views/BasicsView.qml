@@ -26,6 +26,16 @@ Column {
   readonly property var focused: service.focusedMonitor
   property bool allDisplays: false
 
+  // The layout first, as screens on a stage (drag here or in Arrange).
+  MonitorCanvas {
+    width: parent.width
+    height: Style.space(130)
+    service: view.service
+    notes: view.service.displayNotes
+    foreground: view.fg
+    fontFamily: view.ff
+  }
+
   // ------------------------------------------------------------ brightness
 
   Section {
@@ -41,6 +51,8 @@ Column {
         id: brightRow
         required property var modelData
         readonly property var value: view.service.brightness[modelData.name]
+        // In HDR the backlight does nothing visible: the slider sets SDR brightness.
+        readonly property bool hdr: view.service.inHdr(modelData)
         width: view.width
         spacing: Style.space(4)
 
@@ -62,7 +74,9 @@ Column {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(6)
             textFormat: Text.PlainText
-            text: brightRow.value === undefined ? "…" : brightRow.value < 0 ? "fixed" : Math.round(slider.dragging ? slider.liveValue : brightRow.value) + "%"
+            text: brightRow.hdr
+              ? "SDR " + Model.roundTo(sdrSlider.dragging ? sdrSlider.liveValue : brightRow.modelData.sdrBrightness, 2) + "×"
+              : (brightRow.value === undefined ? "…" : brightRow.value < 0 ? "fixed" : Math.round(slider.dragging ? slider.liveValue : brightRow.value) + "%")
             color: view.dim
             font.family: view.ff
             font.pixelSize: Style.font.caption
@@ -71,8 +85,20 @@ Column {
         }
 
         PanelSlider {
+          id: sdrSlider
+          visible: brightRow.hdr
+          bar: view.panel.bar
+          width: parent.width
+          minimum: 0.5
+          maximum: 2
+          step: 0.05
+          value: brightRow.modelData.sdrBrightness || 1
+          onReleased: function(v) { view.service.setSdrBrightnessNow(brightRow.modelData.name, v) }
+        }
+
+        PanelSlider {
           id: slider
-          visible: brightRow.value !== undefined && brightRow.value >= 0
+          visible: !brightRow.hdr && brightRow.value !== undefined && brightRow.value >= 0
           bar: view.panel.bar
           width: parent.width
           minimum: 1

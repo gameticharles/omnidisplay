@@ -231,6 +231,10 @@ reset_log
 check "send-window moves, then makes it fullscreen" 'grep -qF "workspace = \"7\", window = \"address:0xabc123\"" "$LOG" && grep -q "window.fullscreen" "$LOG"'
 check "send-window refuses a bad address" '! "$CTL" send-window "0xabc; rm" 7 >/dev/null 2>&1'
 check "resend-hdr refuses other presets" '! "$CTL" resend-hdr DP-2 srgb >/dev/null 2>&1'
+printf '{\n  "setup.omnidisplay": {}\n}\n' | "$CTL" menu write >/dev/null
+check "menu write saves the extensions file" '[[ $("$CTL" menu read) == *setup.omnidisplay* ]]'
+printf '{}\n' | "$CTL" menu write >/dev/null
+check "and keeps a backup of the old one" '[[ $(cat "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc.omnidisplay.bak") == *setup.omnidisplay* ]]'
 check "store-write saves a profiles store" '[[ $(printf "{\"version\":1,\"profiles\":[]}" | "$CTL" store-write) == *exit=0* && -f "$HOME/.config/omarchy/omnidisplay/profiles.json" ]]'
 check "store-write refuses anything else" '! printf "[1,2]" | "$CTL" store-write >/dev/null 2>&1'
 
