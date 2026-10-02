@@ -150,7 +150,8 @@ Column {
     }
 
     FieldRow {
-      visible: !!view.entry && view.entry.enabled !== false && view.service.draft.length > 1
+      // The laptop panel mirrors through Omarchy's laptop modes (Display tab).
+      visible: !!view.entry && view.entry.enabled !== false && view.service.draft.length > 1 && !view.entry.internal
       label: "Role"
       foreground: view.fg
       fontFamily: view.ff

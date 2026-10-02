@@ -13,6 +13,10 @@ trap 'pkill -f "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 export HOME="$WORK/home"
 export XDG_CONFIG_HOME="$HOME/.config"
+# Every XDG location, or a value from the real session leaks through.
+export XDG_STATE_HOME="$HOME/.local/state"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_RUNTIME_DIR="$WORK/run"
 mkdir -p "$HOME/.config/hypr" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
@@ -27,6 +31,7 @@ case "\$1" in
   getoption) echo '{"option": "x", "int": 1, "set": true }' ;;
   clients) echo '[{"address":"0xabc123","class":"zen","title":"t","workspace":{"id":2},"monitor":0,"fullscreen":0,"mapped":true}]' ;;
   eval) if [[ \$2 == *FAILME* ]]; then echo "error: hl.monitor: unknown field 'FAILME'"; exit 7; fi; echo ok ;;
+  configerrors) if grep -qs BROKEN "\$HOME/.config/hypr/monitors.lua" "\$HOME/.local/state/omarchy/toggles/hypr/display-omnidisplay.lua"; then echo '["monitors.lua:3: bad"]'; else echo '[""]'; fi ;;
   *) echo ok ;;
 esac
 EOF
@@ -62,7 +67,8 @@ check "monitors JSON comes first" '[[ $(jq length <<<"$monitors") == 3 ]]'
 check "then workspaces" '[[ $(jq -r ".[0].monitor" <<<"$workspaces") == eDP-1 ]]'
 check "then status, sha and the file" '[[ $(sed -n 1p <<<"$file") == present && $(sed -n 2p <<<"$file") == "$(sha256sum "$LUA_FILE" | cut -d" " -f1)" && $(sed -n 3p <<<"$file") == "local x = 1" ]]'
 rm -f "$LUA_FILE"
-check "a missing file says so" '[[ $("$CTL" snapshot | tr "\036" "\n" | tail -n 2 | head -n1) == missing ]]'
+check "a missing file says so" '[[ $("$CTL" snapshot | awk -v RS="\036" "NR == 3" | head -n1) == missing ]]'
+check "the state file comes fourth" '[[ $("$CTL" snapshot | awk -v RS="\036" "NR == 4" | head -n1) == missing ]]'
 
 echo
 echo "apply"
@@ -101,7 +107,7 @@ out=$(printf 'local x = 1\n\n-- omnidisplay: begin\n%s\n-- omnidisplay: end\n' "
 check "keep saves the file" '[[ $out == *"__omnidisplay_exit=0"* ]] && grep -qF "$RULE" "$LUA_FILE"'
 check "after a backup of the old one" '[[ $(cat "$HOME"/.config/hypr/monitors.lua.omnidisplay.* | head -n1) == "local x = 1" ]]'
 sleep 4
-check "and the watchdog does not revert" '! grep -qx reload "$LOG"'
+check "and the watchdog does not revert" '! grep -qF "eval $REVERT" "$LOG"'
 
 payload "$RULE" "$REVERT" | "$CTL" apply t6 3 >/dev/null
 out=$(printf 'local y = 2\n' | "$CTL" keep t6 "$sha" 3)
@@ -123,6 +129,37 @@ check "keep will not write through a link to a file it does not own" '[[ $out ==
 sleep 0.5
 rm -f "$LUA_FILE"
 mv "$WORK/real.lua" "$LUA_FILE"
+
+printf 'local ok = 1\n' >"$LUA_FILE"
+sha=$(sha256sum "$LUA_FILE" | cut -d' ' -f1)
+payload "$RULE" "$REVERT" | "$CTL" apply ce1 3 >/dev/null
+out=$(printf 'local ok = 1\n-- BROKEN\n' | "$CTL" keep ce1 "$sha" 3)
+check "a saved file Hyprland reports errors in is put back" '[[ $out == *"__omnidisplay_exit=9"* && $(cat "$LUA_FILE") == "local ok = 1" ]]'
+"$CTL" revert ce1 >/dev/null
+sleep 0.5
+
+STATE_FILE="$HOME/.local/state/omarchy/toggles/hypr/display-omnidisplay.lua"
+payload "$RULE" "$REVERT" | "$CTL" apply st1 3 >/dev/null
+out=$(printf '%s\n' "$RULE" | "$CTL" keep st1 - 3 state)
+check "keep can write the state file instead of monitors.lua" '[[ $out == *exit=0* && $(cat "$STATE_FILE") == "$RULE" && $(cat "$LUA_FILE") == "local ok = 1" ]]'
+sha=$(sha256sum "$STATE_FILE" | cut -d" " -f1)
+payload "$RULE" "$REVERT" | "$CTL" apply st2 3 >/dev/null
+out=$(printf '%s\n-- BROKEN\n' "$RULE" | "$CTL" keep st2 "$sha" 3 state)
+check "a broken state file is put back too" '[[ $out == *exit=9* && $(cat "$STATE_FILE") == "$RULE" ]]'
+"$CTL" revert st2 >/dev/null
+check "state-remove deletes it" '"$CTL" state-remove >/dev/null && [[ ! -e $STATE_FILE ]]'
+sleep 0.5
+
+echo
+echo "adaptive sync"
+reset_log
+jq -cn --arg apply "$RULE" --arg revert "$REVERT" --arg later 'hl.monitor({ output = "DP-2", vrr = 1, sdrsaturation = 1 })' \
+   --arg rlater 'hl.monitor({ output = "DP-2", vrr = -1, sdrsaturation = 1 })' \
+  '{apply: $apply, revert: $revert, applyLater: $later, revertLater: $rlater}' | "$CTL" apply vr1 10 >/dev/null
+check "the second half of a sync change follows the first" 'grep -qF "vrr = 1, sdrsaturation = 1 })" "$LOG"'
+"$CTL" revert vr1 >/dev/null
+check "and the revert sends its second half too" 'grep -qF "vrr = -1, sdrsaturation = 1 })" "$LOG"'
+sleep 0.5
 
 echo
 echo "revert"
@@ -180,7 +217,7 @@ check "terminal-font changes only the size line" '[[ $(cat "$HOME/.config/kitty/
 check "and lists it" '[[ $("$CTL" terminal-font list | jq -r ".[0].size") == 12 ]]'
 check "report removes serials" '! "$CTL" report | grep -q TESTDELL01'
 
-check "options reads the four globals" '[[ $("$CTL" options | jq "keys | length") == 4 ]]'
+check "options reads every global offered" '[[ $("$CTL" options | jq "keys | length") == 11 ]]'
 check "eval-rules takes a known global option" '[[ $(printf "hl.config({ general = { allow_tearing = true } })" | "$CTL" eval-rules) == *exit=0* ]]'
 check "eval-rules refuses any other hl.config" '! printf "hl.config({ misc = { disable_splash = true } })" | "$CTL" eval-rules >/dev/null 2>&1'
 reset_log

@@ -9,6 +9,9 @@ status=0
 
 echo "== lib unit tests"
 node tests/lib.test.js || status=1
+echo
+echo "== boot-time profiles (real Lua)"
+node tests/lua-profiles.test.js || status=1
 [[ ${1:-} == --quick ]] && exit $status
 
 echo

@@ -396,6 +396,7 @@ Item {
       workspaces: o.workspaces || null,
       liveWorkspaces: workspaces,
       laptopMode: o.laptopMode || "",
+      base: liveBase(),
       globals: o.globals !== undefined ? o.globals : draftGlobals,
       liveGlobals: liveGlobals,
       previousWorkspaces: activeProfile ? activeProfile.workspaces : null,
@@ -507,6 +508,8 @@ Item {
       apply: plan.applyLua, revert: plan.revertLua,
       commands: plan.commands, revertCommands: plan.revertCommands, moves: plan.moves,
       reloadFirst: plan.reloadFirst,
+      applyLater: plan.applyLater || "",
+      revertLater: plan.revertLater || "",
       // What a revert must end with; the script re-applies the snapshot
       // until the displays show it.
       expect: pendingSnapshot.map(function(m) {
@@ -746,7 +749,7 @@ Item {
     }
     var want = Profiles.draftFromProfile(monitors, profile)
     var laptop = profile.laptop && hasLaptopChoice && profile.laptop !== laptopMode ? profile.laptop : ""
-    var plan = Plan.buildPlan({ snapshot: monitors, draft: want, persist: false, workspaces: profile.workspaces,
+    var plan = Plan.buildPlan({ snapshot: monitors, base: liveBase(), draft: want, persist: false, workspaces: profile.workspaces,
                                 liveWorkspaces: workspaces, laptopMode: laptop,
                                 // Unknown live values would read as changes every time.
                                 globals: Object.keys(liveGlobals).length ? (store.globals || {}) : {},
@@ -759,10 +762,47 @@ Item {
     _restoreCount++
     run([ctl, "eval-rules"], geometryChanged ? plan.applyLua : "", function(code, out) {
       if (code !== 0) { say("error", "Restoring \"" + profile.name + "\" failed: " + String(out).split("\n")[0]); return }
+      if (plan.applyLater) {
+        laterTimer.later = plan.applyLater
+        laterTimer.restart()
+      }
       for (var i = 0; i < plan.commands.length; i++) Quickshell.execDetached(plan.commands[i])
       if (plan.moves.length) run([ctl, "workspace-moves"], JSON.stringify(plan.moves))
       settleRefresh.restart()
     })
+  }
+
+  // The second half of an adaptive-sync change made without a countdown.
+  Timer {
+    id: laterTimer
+    interval: 500
+    property string later: ""
+    onTriggered: if (later) root.run([root.ctl, "eval-rules"], later)
+  }
+
+  // ------------------------------------------------- drift from the profile
+
+  // What the live state does differently from the active profile, e.g. after
+  // Omarchy's scale hotkey or another tool. Offered back in the panel:
+  // restore the profile, or keep the live state as the profile.
+  readonly property var profileDrift: {
+    if (!loaded || phase !== "" || !activeProfile || restoreTimer.running) return []
+    var want = Profiles.draftFromProfile(monitors, activeProfile)
+    return Plan.draftChanges(monitors, want).filter(function(c) { return c.name !== "Laptop" && c.name !== "Global" })
+  }
+  property bool driftDismissed: false
+  onActiveProfileChanged: driftDismissed = false
+
+  function restoreProfileNow() {
+    _restoreCount = 0
+    _lastRestoreKey = ""
+    autoRestore()
+  }
+
+  function keepLiveAsProfile() {
+    saveProfileFrom(liveBase(), {})
+    if (persistMode === "block+service") writeBlockNow()
+    say("info", "The live layout is now \"" + (activeProfile ? activeProfile.name : "the profile") + "\"")
   }
 
   property var _knownKeys: []
@@ -778,6 +818,18 @@ Item {
       case "monitorremovedv2":
       case "configreloaded":
         if (root.phase === "") root.scheduleRestore()
+        else if (root.phase === "confirm" || root.phase === "applying") {
+          // A display came or went in the middle of a change: the snapshot
+          // no longer describes this set of displays. Take the change back.
+          var before = Profiles.connectedKey(root.pendingSnapshot.length ? root.pendingSnapshot : root.monitors).join("|")
+          root.refresh(function() {
+            if ((root.phase === "confirm" || root.phase === "applying")
+                && Profiles.connectedKey(root.monitors).join("|") !== before) {
+              root.say("error", "A display was connected or removed during the change, so it was reverted")
+              root.revert()
+            }
+          })
+        }
         else root.refresh()
         hotplugNotice.restart()
         break
@@ -1407,6 +1459,14 @@ Item {
         e.width = m.width; e.height = m.height; e.refresh = r
         var c = Model.cleanScale(e.scale, e.width, e.height)
         if (c > 0) e.scale = c
+      }) ? "applying" : "refused"
+    }
+    function mirror(output: string, target: string): string {
+      if (!Model.entryByName(root.monitors, output)) return "no such display"
+      if (target && !Model.entryByName(root.monitors, target)) return "no such display: " + target
+      return root.applyNow(function(list) {
+        var e = Model.entryByName(list, output)
+        if (e) e.mirror = target && target !== output ? target : ""
       }) ? "applying" : "refused"
     }
     function enable(output: string): string {

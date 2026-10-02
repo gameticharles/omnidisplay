@@ -299,6 +299,66 @@ Panel {
             }
           }
 
+          // The live layout drifted from the active profile.
+          BorderSurface {
+            visible: root.ready && root.service.profileDrift.length > 0 && !root.service.driftDismissed
+            width: parent.width
+            height: driftCol.implicitHeight + Style.space(16)
+            color: Util.alpha(Color.accent, 0.08)
+            borderSpec: Border.flat(Util.alpha(Color.accent, 0.6), 1)
+            radius: Style.cornerRadius
+
+            Column {
+              id: driftCol
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.margins: Style.space(10)
+              spacing: Style.space(6)
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: root.ready && root.service.activeProfile
+                  ? "Not saved: the displays differ from \"" + root.service.activeProfile.name + "\" (" +
+                    root.service.profileDrift.map(function(c) { return c.name + ": " + c.changes.join(", ") }).join("; ") + ")"
+                  : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Row {
+                anchors.right: parent.right
+                spacing: Style.space(8)
+                Button {
+                  text: "Ignore"
+                  bordered: true
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.service.driftDismissed = true
+                }
+                Button {
+                  text: "Restore profile"
+                  bordered: true
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.service.restoreProfileNow()
+                }
+                Button {
+                  text: "Keep live"
+                  bordered: true
+                  active: true
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: root.service.keepLiveAsProfile()
+                }
+              }
+            }
+          }
+
           // OmniDisplay's block went missing from monitors.lua.
           BorderSurface {
             visible: root.ready && root.service.blockMissing

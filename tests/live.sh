@@ -107,6 +107,24 @@ ipc revert >/dev/null
 check "Revert puts it back" 'wait_for 5 "[[ \$(pending) == \"\" ]]" && wait_for 4 "[[ \$(live) == \"\$before\" ]]"' "got $(live)"
 
 echo
+echo "mirror and back"
+ipc mirror "$OUT" eDP-1 >/dev/null
+wait_for 6 '[[ $(pending) == confirm ]]'
+check "mirroring goes live" '[[ $(hyprctl monitors all -j | jq -r --arg n "$OUT" ".[] | select(.name == \$n) | .mirrorOf") != none ]]'
+ipc keep >/dev/null
+wait_for 10 '[[ $(pending) == "" ]]'
+ipc mirror "$OUT" "" >/dev/null
+wait_for 6 '[[ $(pending) == confirm ]]'
+check "and extending again clears it" 'wait_for 4 "[[ \$(hyprctl monitors all -j | jq -r --arg n \"\$OUT\" \".[] | select(.name == \\\$n) | .mirrorOf\") == none ]]"'
+ipc keep >/dev/null
+wait_for 10 '[[ $(pending) == "" ]]'
+cp -p "$SAVE/monitors.lua" "$LUA" 2>/dev/null
+sleep 1.5
+hyprctl eval "hl.monitor({ output = \"$OUT\", mode = \"1280x720@60\", position = \"auto-right\", scale = 1, transform = 0, mirror = \"\", disabled = false })" >/dev/null
+sleep 1
+before=$(live)
+
+echo
 echo "refused changes"
 check "a mode the display does not offer is refused before anything runs" '[[ $(ipc setMode "$OUT" 1234x567@60) == refused ]]' "$(ipc messages)"
 check "nothing is pending after a refusal" '[[ $(pending) == "" ]]'

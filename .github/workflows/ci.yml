@@ -21,6 +21,9 @@ jobs:
       - name: Library tests
         run: node tests/lib.test.js
 
+      - name: Boot-time profile tests (skipped without lua)
+        run: node tests/lua-profiles.test.js
+
       - name: Control script tests
         run: bash tests/ctl.test.sh
 

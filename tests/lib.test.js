@@ -505,6 +505,138 @@ test("the rule reader caches by text", () => {
   assert.notStrictEqual(Lua.findMonitorRules(userLua + "\n"), a)
 })
 
+console.log("\nTier 1")
+
+test("a request taken back is written as Hyprland's default", () => {
+  const base = Model.cloneList(desk)
+  Object.assign(byName(base, "DP-2"), { cmSet: "hdr", bitdepth: 10, vrr: 1, sdrbrightness: 1.4, maxLuminance: 600 })
+  const draft = Model.cloneList(base)
+  Object.assign(byName(draft, "DP-2"), { cmSet: "", bitdepth: 0, vrr: -1, sdrbrightness: 0, maxLuminance: null })
+  assert.deepStrictEqual(Lua.resetsBetween(byName(base, "DP-2"), byName(draft, "DP-2")).sort(),
+                         ["bitdepth", "cmSet", "maxLuminance", "sdrbrightness", "vrr"])
+  const plan = Plan.buildPlan({ snapshot: desk, base, draft })
+  assert.ok(plan.ok, JSON.stringify(plan.errors))
+  const dp = plan.applyLua.split("\n").filter(l => /"DP-2"/.test(l)).join("\n")
+  for (const f of ['cm = "auto"', "bitdepth = 8", "sdrbrightness = 1", "max_luminance = -1"]) assert.ok(dp.includes(f), f + " in " + dp)
+  // the file never gets defaults: the user's own rules decide again
+  assert.ok(!/cm = "auto"/.test(Plan.buildPlan({ snapshot: desk, base, draft, persist: true, fileState: "missing" }).block))
+})
+
+test("an adaptive-sync change goes out nudged, then for real", () => {
+  const draft = Model.cloneList(desk)
+  byName(draft, "DP-2").vrr = 2
+  const plan = Plan.buildPlan({ snapshot: desk, draft })
+  assert.ok(plan.ok, JSON.stringify(plan.errors))
+  assert.ok(/output = "DP-2".*vrr = 2.*sdrsaturation = 1.0001/.test(plan.applyLua))
+  assert.ok(/output = "DP-2".*vrr = 2.*sdrsaturation = 1\b/.test(plan.applyLater))
+  assert.ok(/output = "DP-2".*vrr = -1.*sdrsaturation = 1\b/.test(plan.revertLater))
+  assert.ok(Lua.evalLinesOk(plan.applyLater))
+  assert.strictEqual(Plan.buildPlan({ snapshot: desk, draft: desk }).applyLater, "")
+})
+
+test("clearing an ICC profile reloads first (Hyprland refuses an empty path)", () => {
+  const base = Model.cloneList(desk)
+  byName(base, "DP-2").icc = "/a/b.icc"
+  assert.strictEqual(Plan.buildPlan({ snapshot: desk, base, draft: desk }).reloadFirst, true)
+})
+
+test("the laptop panel's mirroring is left to Omarchy", () => {
+  assert.ok(!/mirror/.test(Lua.monitorRule(byName(desk, "eDP-1"), "eDP-1", { skipMirror: true, skipDisabled: true })))
+})
+
+test("mode keywords, automatic positions and EDID modelines", () => {
+  const e = Object.assign({}, byName(desk, "DP-2"), { modeKeyword: "highrr", positionAuto: "auto-right" })
+  assert.ok(/mode = "highrr", position = "auto-right"/.test(Lua.monitorRule(e, "DP-2", {})))
+  assert.ok(Lua.modelineOk("342.06 1920 1968 2000 2080 1080 1083 1088 1142 -hsync -vsync"))
+  assert.ok(!Lua.modelineOk("342 1920; os.execute"))
+  const m = Object.assign({}, byName(desk, "DP-2"), { modeline: "241.5 2560 2608 2640 2720 1440 1443 1448 1481 +hsync -vsync", width: 2560, height: 1440, refresh: 59.95 })
+  assert.ok(/mode = "modeline 241.5 2560/.test(Lua.monitorRule(m, "DP-2", {})))
+  assert.ok(Plan.buildPlan({ snapshot: desk, draft: desk.map(x => x.name === "DP-2" ? m : x) }).ok)
+})
+
+test("HDR details: valid ones written, junk dropped from profiles", () => {
+  const e = Object.assign({}, byName(desk, "DP-2"), { supportsHdr: 1, sdrMaxLuminance: 203, sdrEotf: "gamma22", maxLuminance: 99999 })
+  const rule = Lua.monitorRule(e, "DP-2", {})
+  assert.ok(/supports_hdr = 1/.test(rule) && /sdr_max_luminance = 203/.test(rule) && /sdr_eotf = "gamma22"/.test(rule))
+  assert.ok(!/max_luminance = 99999/.test(rule))
+  const s = Profiles.cleanSettings({ supportsHdr: 1, maxLuminance: "x", sdrEotf: "bogus" })
+  assert.strictEqual(s.supportsHdr, 1)
+  assert.strictEqual(s.maxLuminance, null)
+  assert.strictEqual(s.sdrEotf, "")
+})
+
+console.log("\nTier 2")
+
+const edidX = [
+  "    DTD 1:  2560x1440  165.000000 Hz  16:9",
+  '      Modeline "2560x1440_165.00" 645.000  2560 2568 2600 2640  1440 1443 1448 1481  +HSync -VSync',
+  '      Modeline "2560x1440_59.95" 241.500  2560 2608 2640 2720  1440 1443 1448 1481  +HSync -VSync'
+].join("\n")
+
+test("EDID modelines become Hyprland modelines", () => {
+  const modes = Model.parseModelines(edidX)
+  assert.strictEqual(modes.length, 2)
+  assert.strictEqual(modes[0].refresh, 164.97)
+  assert.strictEqual(modes[1].modeline, "241.5 2560 2608 2640 2720 1440 1443 1448 1481 +hsync -vsync")
+  assert.ok(Lua.modelineOk(modes[0].modeline))
+  assert.strictEqual(Model.parseModelines(fixture("edid-laptop.txt")).length, 0)
+})
+
+test("EDID-only modes join the list and a drifted rate maps back", () => {
+  const dell = Object.assign({}, byName(desk, "DP-2"), { refresh: 59.83 })
+  const withEdid = Model.withEdidModes(dell, Model.parseModelines(edidX))
+  assert.ok(Model.hasMode(withEdid, 2560, 1440, 164.97))
+  assert.strictEqual(Model.modelineFor(withEdid, 2560, 1440, 164.97).split(" ")[0], "645")
+  assert.strictEqual(Model.modelineFor(withEdid, 2560, 1440, 59.95), "")
+  const custom = Model.parseMonitors(JSON.stringify([{ name: "DP-9", width: 2560, height: 1440, refreshRate: 164.6, scale: 1,
+                                                       availableModes: ["1920x1080@60.00Hz"] }]))[0]
+  const mapped = Model.withEdidModes(custom, Model.parseModelines(edidX))
+  assert.strictEqual(mapped.refresh, 164.97)
+  assert.ok(mapped.modeline.startsWith("645"))
+})
+
+test("native only from the EDID: suggest the gentlest rate at 50 Hz or more", () => {
+  const e = Model.withEdidModes(Object.assign({}, byName(desk, "DP-2"), {
+    width: 1920, height: 1080, refresh: 60,
+    modes: Model.parseModes(["1920x1080@60.00Hz"]) }), Model.parseModelines(edidX))
+  const ins = Model.healthInsights(e, null).find(i => i.code === "not-native")
+  assert.ok(ins && /only the EDID/.test(ins.message))
+  assert.strictEqual(ins.fix.refresh, 59.95)
+})
+
+test("per-monitor memory: a known monitor in a new set gets its settings and place", () => {
+  const kept = Model.cloneList(desk)
+  byName(kept, "DP-2").scale = 1.25
+  let s = Profiles.rememberMonitors(Profiles.emptyStore(), kept, 5)
+  const mem = s.monitors["Dell Inc. DELL U2719D TESTDELL01"]
+  assert.strictEqual(mem.scale, 1.25)
+  assert.strictEqual(mem.neighbor, "Chimei Innolux Corporation 0x1521")
+  s = Profiles.parseStore(Profiles.serializeStore(s))
+  // A new set: the laptop and the Dell only, Dell back at 1x somewhere else.
+  const now = Model.cloneList(desk.filter(m => m.name !== "HDMI-A-1"))
+  Object.assign(byName(now, "DP-2"), { scale: 1, x: 0, y: 1080 })
+  Object.assign(byName(now, "eDP-1"), { x: 0, y: 0 })
+  const d = Profiles.draftFromMemory(now, s)
+  assert.strictEqual(byName(d, "DP-2").scale, 1.25)
+  assert.strictEqual(Layout.sideOf(d.filter(Model.isArrangeable), "DP-2", "eDP-1"), "right")
+  assert.strictEqual(Profiles.draftFromMemory(laptop.map(m => Object.assign({}, m, { description: "Other 0x1" })), s), null)
+})
+
+test("profiles remember the connector each display was on", () => {
+  const s = Profiles.upsertProfile(Profiles.emptyStore(), desk, null, 1).store
+  assert.strictEqual(s.profiles[0].ports["Dell Inc. DELL U2719D TESTDELL01"], "DP-2")
+  const entries = Profiles.entriesFromProfile(s.profiles[0])
+  assert.deepStrictEqual(entries.map(e => e.name).sort(), ["DP-2", "HDMI-A-1", "eDP-1"])
+  assert.strictEqual(byName(entries, "DP-2").description, "Dell Inc. DELL U2719D TESTDELL01")
+})
+
+test("string global options are quoted and checked", () => {
+  assert.strictEqual(Lua.globalLua("render.cm_sdr_eotf", "gamma22"), 'hl.config({ render = { cm_sdr_eotf = "gamma22" } })')
+  assert.strictEqual(Lua.globalLua("render.cm_sdr_eotf", "evil"), null)
+  assert.ok(Lua.evalLinesOk(Lua.globalLua("cursor.no_hardware_cursors", 2)))
+  assert.ok(!Lua.evalLinesOk('hl.config({ cursor = { inactive_timeout = 5 } })'))
+})
+
 console.log("\nCast")
 
 test("cast state: one list, sessions win over peers", () => {
