@@ -115,18 +115,21 @@ cmd_status() {
   command -v qrencode >/dev/null 2>&1 && qr=true
   pid=$(running_pid) || pid=""
   [[ -n $pid && -f $SESSION_FILE ]] && session=$(cat -- "$SESSION_FILE")
-  local password=""
-  if [[ -n $pid ]] && jq -e '.access == "network"' <<<"$session" >/dev/null 2>&1; then
-    password=$(cat -- "$VNC_DIR/password" 2>/dev/null)
+  # jq reads the password from its file (--rawfile): only the path is an
+  # argument. Passing the value with --arg put it in jq's argv, which every
+  # local user can read through ps or /proc/<pid>/cmdline.
+  local password_file=/dev/null
+  if [[ -n $pid && -r $VNC_DIR/password ]] && jq -e '.access == "network"' <<<"$session" >/dev/null 2>&1; then
+    password_file="$VNC_DIR/password"
   fi
   local listen=false
   [[ -n $pid ]] && listening && listen=true
   lan_addresses | jq -Rn \
     --argjson installed "$installed" --argjson qr "$qr" --arg pid "$pid" --argjson listening "$listen" \
     --arg ssh "ssh -L $PORT:127.0.0.1:$PORT $(id -un)@$(lan_addresses | head -n1 | cut -f2)" \
-    --argjson session "$session" --arg password "$password" --arg user "$USERNAME" --argjson port "$PORT" \
+    --argjson session "$session" --rawfile password "$password_file" --arg user "$USERNAME" --argjson port "$PORT" \
     '{installed: $installed, qrencode: $qr, running: ($pid != ""), listening: $listening, session: $session,
-      port: $port, username: $user, password: $password, ssh: $ssh,
+      port: $port, username: $user, password: ($password | rtrimstr("\n")), ssh: $ssh,
       addresses: [inputs | split("\t") | {interface: .[0], address: .[1], kind: (.[2] // "Other")}]}'
 }
 

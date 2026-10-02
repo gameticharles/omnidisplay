@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- `omnidisplay-vnc status` handed the network session's VNC password to jq
+  as a command-line argument (`--arg`), where any local user could read it
+  through `ps` or `/proc`. jq now reads it from its owner-only file
+  (`--rawfile`), so only the path is an argument. A test runs status with a
+  jq that records its arguments and fails if the password is among them.
+
 ## [1.0.0] - 2026-10-02
 
 Visuals and workflow adopted from crmne's hyprmoncfg (MIT).

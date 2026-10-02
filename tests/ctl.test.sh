@@ -239,5 +239,30 @@ check "store-write saves a profiles store" '[[ $(printf "{\"version\":1,\"profil
 check "store-write refuses anything else" '! printf "[1,2]" | "$CTL" store-write >/dev/null 2>&1'
 
 echo
+echo "vnc status"
+VNC="$ROOT/bin/omnidisplay-vnc"
+VNC_SECRET="Zq7RkP2mWx9TbN4c"
+mkdir -p -m 700 "$HOME/.config/omarchy/omnidisplay/vnc" "$XDG_RUNTIME_DIR/omnidisplay"
+printf '%s' "$VNC_SECRET" >"$HOME/.config/omarchy/omnidisplay/vnc/password"
+# A stand-in for a running network session: a process whose name ends in wayvnc.
+(exec -a "$WORK/wayvnc" sleep 60) &
+VNC_STANDIN=$!
+printf '%s\n' "$VNC_STANDIN" >"$XDG_RUNTIME_DIR/omnidisplay/wayvnc.pid"
+printf '{"mode":"extend","size":"1920x1200@60","side":"right","access":"network","output":"OMNI-TAB1"}' \
+  >"$XDG_RUNTIME_DIR/omnidisplay/vnc-session.json"
+# jq, recording every argument it is started with.
+JQ_REAL=$(command -v jq)
+printf '#!/bin/bash\nprintf "%%s\\n" "$@" >>"%s"\nexec "%s" "$@"\n' "$WORK/jq-argv.log" "$JQ_REAL" >"$WORK/bin/jq"
+chmod +x "$WORK/bin/jq"
+out=$(OMNIDISPLAY_VNC_PORT=59917 "$VNC" status)
+rm -f "$WORK/bin/jq"
+check "status gives the panel the network session's password" '[[ $(jq -r .password <<<"$out") == "$VNC_SECRET" ]]'
+check "without the password in any argument" '[[ -s "$WORK/jq-argv.log" ]] && ! grep -qF "$VNC_SECRET" "$WORK/jq-argv.log"'
+printf '{"mode":"extend","size":"1920x1200@60","side":"right","access":"local","output":"OMNI-TAB1"}' \
+  >"$XDG_RUNTIME_DIR/omnidisplay/vnc-session.json"
+check "a local session gives no password" '[[ $(OMNIDISPLAY_VNC_PORT=59917 "$VNC" status | jq -r .password) == "" ]]'
+kill "$VNC_STANDIN" 2>/dev/null
+
+echo
 echo "$pass passed, $fail failed"
 (( fail == 0 ))
