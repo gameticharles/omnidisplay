@@ -1,0 +1,42 @@
+OmniDisplay contains code adapted from the following MIT-licensed projects.
+Each is used under the MIT License (the same text as LICENSE), with the
+copyright notice below.
+
+Omarchy, the built-in Display widget
+  (shell/plugins/panels/monitor/, https://github.com/omacom/omarchy)
+  Copyright (c) David Heinemeier Hansson
+  Used in: lib/Model.js (clean scales, scale presets, brightness names),
+  views/BasicsView.qml (text-size stops, brightness and scale rows).
+
+omarchy-displays, https://github.com/stevederico/omarchy-displays
+  Copyright (c) 2026 sd (Steve Derico)
+  Used in: lib/Layout.js (snapping, gap closing, reflow, placement),
+  lib/Lua.js (comment-aware rule reading, selector choice, managed block),
+  lib/Model.js (mode parsing), bin/omnidisplay-ctl (the revert watchdog,
+  private token files, guarded save).
+
+omarchy-monitor-layout, https://github.com/kris-1/omarchy-monitor-layout
+  Copyright (c) 2026 Krzysztof Golab Magalhaes
+  Used in: lib/Layout.js (staging moves), components/IdentifyOverlay.qml,
+  Service.qml (restoring the layout on hotplug and config reloads),
+  lib/Profiles.js (laptop modes through Omarchy's internal-monitor toggles).
+
+omarchy-wireless-display, https://github.com/alchemy/omarchy-wireless-display
+  Copyright (c) 2026 Filippo Veneri
+  Used in: bin/omnidisplay-cast (ported control script), lib/Cast.js
+  (ported state model), views/CastView.qml (row behaviour, PIN entry).
+
+better.displays, https://github.com/nightdevil00/better.displays
+  Copyright (c) 2026 nightdevil00
+  Used in: bin/omnidisplay-ctl (input validation patterns, per-terminal font
+  sizes).
+
+omarchy-display-manager, https://github.com/Azteriisk/omarchy-display-manager
+  Copyright (c) 2026 Azteriisk
+  Ideas: per-display mirroring, the workspace "display 1" role and snap
+  presets. No code was copied.
+
+Ideas, reimplemented without copying code: Vista (formerly Panorama, HDR
+and colour management, EDID capabilities), Better Displays Pro (native-mode
+insights, density-based scale suggestion), hyprmoncfg (profiles, workspace
+planner), Omarchy Virtual Display and Tablet Display (VNC screens).

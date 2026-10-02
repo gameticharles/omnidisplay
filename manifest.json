@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "id": "omnidisplay",
+  "name": "OmniDisplay",
+  "version": "0.2.0",
+  "author": "Charles Gameti",
+  "license": "MIT",
+  "description": "Every display setting in one bar widget: drag-and-drop arrangement, resolution, refresh, scale, rotation, mirroring, HDR and colour, adaptive sync, brightness (backlight and DDC/CI), auto-switching profiles, workspace planning, Miracast/AirPlay casting and tablet screens, with every change kept only after you confirm it.",
+  "homepage": "https://github.com/gameticharles/omnidisplay",
+  "repository": "https://github.com/gameticharles/omnidisplay",
+  "keywords": [
+    "display",
+    "displays",
+    "monitor",
+    "monitors",
+    "arrange",
+    "resolution",
+    "scale",
+    "hdr",
+    "brightness",
+    "ddc",
+    "profiles",
+    "workspaces",
+    "miracast",
+    "airplay",
+    "vnc",
+    "bar-widget"
+  ],
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.monitor"
+  },
+  "barWidget": {
+    "displayName": "Displays",
+    "description": "Arrange displays, change modes, scale, rotation, colour and brightness, switch profiles, cast and use a tablet as a screen",
+    "category": "System",
+    "aliases": [
+      "display",
+      "monitor",
+      "screen",
+      "brightness",
+      "cast",
+      "projector"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barLabel": "none",
+      "confirmSeconds": 15,
+      "persistMode": "block+service",
+      "autoProfiles": true,
+      "backupsKept": 10,
+      "snapThreshold": 48,
+      "identifyOnOpen": false,
+      "ddc": true,
+      "showColor": true,
+      "showCast": true,
+      "presentationMode": false,
+      "notifications": true,
+      "terminalFontOverrides": false
+    },
+    "schema": [
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Text beside the icon",
+        "options": [
+          "none",
+          "count",
+          "profile",
+          "cast"
+        ],
+        "defaultValue": "none",
+        "description": "How many displays are on, the active profile's name, or what a cast is doing. Vertical bars stay icon-only."
+      },
+      {
+        "key": "confirmSeconds",
+        "type": "integer",
+        "label": "Seconds to keep a change",
+        "min": 5,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 15,
+        "description": "Every change goes live first. Without Keep in this time, the previous settings come back on their own."
+      },
+      {
+        "key": "persistMode",
+        "type": "enum",
+        "label": "Where kept settings go",
+        "options": [
+          "block+service",
+          "service-only"
+        ],
+        "defaultValue": "block+service",
+        "description": "block+service writes one managed block at the end of monitors.lua (right from boot) and restores profiles on hotplug. service-only never edits monitors.lua."
+      },
+      {
+        "key": "autoProfiles",
+        "type": "boolean",
+        "label": "Switch profiles automatically",
+        "defaultValue": true,
+        "description": "When displays are plugged in or out, or Hyprland reloads, the profile kept for that set of displays is applied again."
+      },
+      {
+        "key": "backupsKept",
+        "type": "integer",
+        "label": "monitors.lua backups to keep",
+        "min": 1,
+        "max": 50,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "A copy is taken before every save. They can be restored from the Profiles tab."
+      },
+      {
+        "key": "snapThreshold",
+        "type": "integer",
+        "label": "Snapping distance",
+        "min": 0,
+        "max": 400,
+        "step": 8,
+        "defaultValue": 48,
+        "description": "In logical pixels: how close a dragged display must land to snap to a neighbour's start, centre or end."
+      },
+      {
+        "key": "identifyOnOpen",
+        "type": "boolean",
+        "label": "Identify displays when the panel opens",
+        "defaultValue": false,
+        "description": "Shows each screen's number for a moment, matching the tiles."
+      },
+      {
+        "key": "ddc",
+        "type": "boolean",
+        "label": "External monitor brightness (DDC/CI)",
+        "defaultValue": true,
+        "description": "Uses ddcutil, when installed, for brightness, contrast and input source on external monitors."
+      },
+      {
+        "key": "showColor",
+        "type": "boolean",
+        "label": "Show the Colour tab",
+        "defaultValue": true,
+        "description": "HDR, colour presets, bit depth and SDR controls."
+      },
+      {
+        "key": "showCast",
+        "type": "boolean",
+        "label": "Show the Cast tab",
+        "defaultValue": true,
+        "description": "Miracast and AirPlay casting, and tablets as screens."
+      },
+      {
+        "key": "presentationMode",
+        "type": "boolean",
+        "label": "Presentation mode while casting or mirroring",
+        "defaultValue": false,
+        "description": "Keeps the screen awake and notifications quiet while a cast streams or the laptop mirrors, and puts both back afterwards."
+      },
+      {
+        "key": "notifications",
+        "type": "boolean",
+        "label": "Notifications",
+        "defaultValue": true,
+        "description": "A note when an unknown set of displays is connected, and when the watchdog reverted a change."
+      },
+      {
+        "key": "terminalFontOverrides",
+        "type": "boolean",
+        "label": "Per-terminal font sizes",
+        "defaultValue": false,
+        "description": "Adds a font size row per installed terminal under Text size."
+      }
+    ]
+  }
+}

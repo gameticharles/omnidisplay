@@ -1,0 +1,830 @@
+#!/bin/bash
+
+# omarchy:summary=Backend for the OmniDisplay panel: read, apply, keep and revert display settings
+# omarchy:group=omnidisplay
+#
+# Every value that reaches Lua, a file or another program is checked here
+# against a strict pattern first, whatever the panel already checked. Large
+# payloads (Lua, file contents) arrive on stdin, never in argv: argv has a
+# 128 KiB limit and is readable by every local user through `ps`.
+#
+# Commands
+#   snapshot                      monitors JSON ␞ workspaces JSON ␞ monitors.lua (status, sha256, text)
+#   apply <token> <seconds>       stdin JSON {apply, revert, commands, revertCommands, moves};
+#                                 arms the watchdog, then applies live
+#   keep <token> <sha|-> <backups> stdin: the new monitors.lua ("" to keep without saving)
+#   revert <token>                revert now and stand the watchdog down
+#   armed                         number of watchdogs still armed
+#   eval-rules                    stdin Lua; apply without a watchdog (the service restoring a kept profile)
+#   options                       the global options OmniDisplay offers, as JSON
+#   windows                       open windows, as JSON
+#   send-window <address> <ws>    move a window to a workspace and make it fullscreen
+#   return-window <address> <ws>  undo send-window
+#   resend-hdr <connector> <cm>   switch to sRGB and back, so the panel gets its HDR metadata again
+#   workspace-moves               stdin JSON [{workspace, name}]
+#   store-write                   stdin JSON; saves profiles.json atomically
+#   backups list | show <stamp> | restore <stamp>
+#   edid <connector>              edid-decode of the display's EDID
+#   ddc detect | get <bus> | set <bus> <vcp> <value>
+#   headless create <name> <WxH@R> | remove <name> | list
+#   night status | on | off | temperature <K>
+#   present on | off | status
+#   terminal-font list | set <terminal> <size>
+#   report                        a diagnostic summary with serial numbers removed
+#
+# The watchdog: `apply` writes the revert to private token files and starts
+# a detached copy of this script (`watchdog`) before anything changes. It
+# reverts after <seconds> unless `keep` or `revert` stood it down, so a layout
+# that takes the screen, the panel or the whole shell down still comes back.
+# The revert is `hyprctl reload` (monitors.lua is untouched until Keep), and
+# `hyprctl eval` of the previous rules if the reload fails.
+#
+# The watchdog and the token handling follow Steve Derico's omarchy-displays
+# (MIT). See NOTICE.
+
+set -uo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+HYPRCTL="${OMNIDISPLAY_HYPRCTL:-hyprctl}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+MONITORS_LUA="$CONFIG_HOME/hypr/monitors.lua"
+STATE_DIR="$CONFIG_HOME/omarchy/omnidisplay"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp/omnidisplay-$UID}/omnidisplay"
+TOKEN_DIR="$RUN_DIR/tokens"
+MAX_FILE_BYTES=$((120 * 1024))
+MARKER="__omnidisplay_exit="
+BACKUP_PREFIX="monitors.lua.omnidisplay."
+
+die() { printf '%s\n' "$*" >&2; exit 2; }
+
+# ------------------------------------------------------------ validation
+
+valid_token() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
+valid_name() { [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
+valid_int() { [[ $1 =~ ^[0-9]{1,9}$ ]]; }
+valid_stamp() { [[ $1 =~ ^[0-9]{1,12}$ ]]; }
+valid_mode() { [[ $1 =~ ^[0-9]{2,5}x[0-9]{2,5}@[0-9]{1,3}(\.[0-9]{1,5})?$ ]]; }
+
+# The Lua the panel builds is plain hl.monitor and hl.workspace_rule lines.
+# Anything else is refused, with string literals blanked first so a display
+# description cannot hide or fake a call.
+GLOBAL_LINE='^hl\.config\(\{ (general = \{ allow_tearing = (true|false)|render = \{ direct_scanout = [0-2]|render = \{ cm_auto_hdr = [0-2]|misc = \{ vrr = [0-3]) \} \}\)$'
+
+lua_ok() {
+  local line unquoted
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    [[ $line =~ $GLOBAL_LINE ]] && continue
+    [[ $line =~ ^hl\.(monitor|workspace_rule)\(\{\ .*\ \}\)$ ]] || return 1
+    unquoted=$(printf '%s' "$line" | sed -E 's/"([^"\\]|\\.)*"/""/g')
+    if printf '%s' "$unquoted" | grep -Eq '(^|[^A-Za-z0-9_])(os|io|require|dofile|loadfile|load|loadstring|package|debug|exec_cmd)([^A-Za-z0-9_]|$)|hl\.dsp'; then
+      return 1
+    fi
+  done <<<"$1"
+  return 0
+}
+
+# Omarchy's own laptop-panel toggles are the only commands a plan may run.
+command_ok() {
+  [[ $1 =~ ^omarchy-hyprland-monitor-internal(-mirror)?\ (on|off)$ ]]
+}
+
+# ------------------------------------------------------------ private files
+
+private_dir() {
+  [[ -L $1 ]] && return 1
+  if [[ ! -e $1 ]]; then
+    mkdir -p -- "$(dirname -- "$1")" && mkdir -m 700 -- "$1" || return 1
+  fi
+  [[ -d $1 && ! -L $1 && -O $1 ]] || return 1
+  chmod 700 -- "$1"
+}
+
+# Writes through a private temp file renamed into place, so a symlink left at
+# the path is replaced, never followed.
+put_file() {
+  local tmp
+  tmp=$(mktemp -- "$1.tmp.XXXXXX") || return 1
+  if printf '%s' "$2" >"$tmp" && mv -fT -- "$tmp" "$1"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+sha_of() {
+  if [[ -f $1 ]]; then sha256sum -- "$1" | cut -d' ' -f1; else echo "-"; fi
+}
+
+# --------------------------------------------------------------- snapshot
+
+cmd_snapshot() {
+  "$HYPRCTL" monitors all -j 2>/dev/null || echo "[]"
+  printf '\036'
+  "$HYPRCTL" workspaces -j 2>/dev/null || echo "[]"
+  printf '\036'
+  read_file "$MONITORS_LUA"
+}
+
+# One status line (present | missing | toolarge | unreadable), the sha256,
+# then the file. Only a regular readable file under the cap is streamed.
+read_file() {
+  local path="$1" size
+  if [[ ! -e $path ]]; then printf 'missing\n-\n'; return; fi
+  if [[ ! -f $path || ! -r $path ]]; then printf 'unreadable\n-\n'; return; fi
+  size=$(wc -c <"$path" 2>/dev/null) || size=
+  [[ $size =~ ^[0-9]+$ ]] || { printf 'unreadable\n-\n'; return; }
+  if (( size > MAX_FILE_BYTES )); then printf 'toolarge\n%s\n' "$(sha_of "$path")"; return; fi
+  printf 'present\n%s\n' "$(sha_of "$path")"
+  head -c "$MAX_FILE_BYTES" -- "$path"
+}
+
+# ---------------------------------------------------------------- revert
+
+# Expects $token. Runs the saved Omarchy toggle commands, reloads (which
+# restores everything monitors.lua sets: sync, colour, depth), then
+# evaluates the snapshot rules taken before the change, which put back the
+# exact mode, position, scale and rotation even for state that never came
+# from the file (a virtual output, a change another tool made live). The
+# snapshot alone still restores those when the reload fails.
+# The token's files, read into memory before anything else happens: a
+# watchdog standing down removes them, and must not do so under a revert
+# that is still using them.
+load_token() {
+  revert_lua=$(cat -- "$TOKEN_DIR/$token.lua" 2>/dev/null)
+  revert_cmds_saved=$(cat -- "$TOKEN_DIR/$token.cmds" 2>/dev/null)
+  revert_expect=$(cat -- "$TOKEN_DIR/$token.expect" 2>/dev/null)
+}
+
+# Expects load_token to have run.
+revert_now() {
+  local line out code reloaded=0
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    command_ok "$line" || continue
+    # shellcheck disable=SC2086
+    $line >/dev/null 2>&1 || true
+  done <<<"$revert_cmds_saved"
+  out=$("$HYPRCTL" reload 2>&1); code=$?
+  if (( code == 0 )) && ! grep -qi error <<<"$out"; then
+    reloaded=1
+  else
+    echo "reload failed ($code): $out"
+  fi
+  if [[ -n $revert_lua ]]; then
+    local lua="$revert_lua" attempt
+    if lua_ok "$lua"; then
+      # Hyprland applies a reload's monitor rules a moment after `reload`
+      # returns and can land them over the snapshot, so the snapshot is
+      # applied until the displays show the state from before the change.
+      for attempt in 1 2 3; do
+        (( reloaded )) && sleep $(( attempt == 1 ? 0 : 1 )).5
+        out=$("$HYPRCTL" eval "$lua" 2>&1); code=$?
+        if (( code != 0 )) || grep -qi '^error' <<<"$out"; then
+          echo "snapshot eval failed ($code): $out"
+          break
+        fi
+        if [[ -z $revert_expect || $revert_expect == "[]" ]] || wait_matches "$revert_expect"; then
+          echo "reverted"
+          return 0
+        fi
+      done
+      [[ -n $revert_expect && $revert_expect != "[]" ]] && echo "the displays did not settle on the previous state"
+    fi
+  fi
+  if (( reloaded )); then
+    echo "reverted by reload"
+    return 0
+  fi
+  return 1
+}
+
+# Whether the live displays match the expected state (JSON written by apply):
+# mode, scale, rotation and, for displays on the desktop, position. Outputs
+# that are gone, and on/off of the laptop panel (Omarchy's toggles), are not
+# compared. Polls for up to two seconds.
+wait_matches() {
+  local want="$1" i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if "$HYPRCTL" monitors all -j 2>/dev/null | jq -e --argjson want "[$want]" '
+        . as $live
+        | all($want[0][]; . as $w
+          | ($live | map(select(.name == $w.name)) | .[0]) as $m
+          | ($m == null)
+            or ($w.enabled == false and $m.disabled == true)
+            or ($w.internal == true and ($m.disabled == true or $w.enabled == false))
+            or ($m.disabled != true and $w.enabled != false
+                and $m.width == $w.width and $m.height == $w.height
+                and ((($m.scale - $w.scale) | if . < 0 then -. else . end) < 0.01)
+                and $m.transform == $w.transform
+                and (($w.mirror // "") != "" or ($m.x == $w.x and $m.y == $w.y))))' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+clear_token() {
+  rm -f -- "$TOKEN_DIR/$token.expect" "$TOKEN_DIR/$token.lua" "$TOKEN_DIR/$token.cmds" "$TOKEN_DIR/$token.keep" \
+           "$TOKEN_DIR/$token.done" "$TOKEN_DIR/$token.revert"
+}
+
+cmd_watchdog() {
+  token="$1"
+  local secs="$2"
+  valid_token "$token" && valid_int "$secs" || exit 2
+  private_dir "$RUN_DIR" && private_dir "$TOKEN_DIR" || exit 1
+  put_file "$TOKEN_DIR/$token.live" "$$" || exit 1
+  trap 'rm -f -- "$TOKEN_DIR/$token.live"' EXIT
+  local ticks=$((secs * 5)) i=0
+  while (( i < ticks )); do
+    if [[ -e $TOKEN_DIR/$token.keep || -e $TOKEN_DIR/$token.done ]]; then
+      clear_token
+      exit 0
+    fi
+    [[ -e $TOKEN_DIR/$token.revert ]] && break
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if [[ -e $TOKEN_DIR/$token.keep || -e $TOKEN_DIR/$token.done ]]; then
+    clear_token
+    exit 0
+  fi
+  load_token
+  revert_now >"$TOKEN_DIR/$token.result" 2>&1
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a OmniDisplay -i video-display "Display settings reverted" "The change was not kept, so the previous settings are back." >/dev/null 2>&1
+  clear_token
+}
+
+# How many watchdogs are still armed. Clears what dead ones left behind.
+cmd_armed() {
+  local live=0 f pid
+  if [[ -L $TOKEN_DIR || ! -d $TOKEN_DIR || ! -O $TOKEN_DIR ]]; then echo 0; return; fi
+  find "$TOKEN_DIR" -maxdepth 1 -type f -name '*.tmp.??????' -mmin +1 -delete 2>/dev/null
+  find "$TOKEN_DIR" -maxdepth 1 -type f -name '*.result' -mmin +1440 -delete 2>/dev/null
+  for f in "$TOKEN_DIR"/*.live; do
+    [[ -e $f ]] || continue
+    pid=$(cat -- "$f" 2>/dev/null)
+    if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] &&
+       tr '\0' '\n' <"/proc/$pid/cmdline" | grep -qx watchdog &&
+       tr '\0' '\n' <"/proc/$pid/cmdline" | grep -q 'omnidisplay-ctl$'; then
+      live=$((live + 1))
+    else
+      rm -f -- "$f"
+    fi
+  done
+  echo "$live"
+}
+
+# ----------------------------------------------------------------- apply
+
+cmd_apply() {
+  token="$1"
+  local secs="$2" payload lua revert cmds moves out code
+  valid_token "$token" && valid_int "$secs" && (( secs >= 3 && secs <= 120 )) || die "usage: apply <token> <seconds>"
+  payload=$(head -c 400000)
+  lua=$(jq -r '.apply // ""' <<<"$payload") || die "bad payload"
+  revert=$(jq -r '.revert // ""' <<<"$payload") || die "bad payload"
+  cmds=$(jq -r '(.commands // [])[] | join(" ")' <<<"$payload") || die "bad payload"
+  local revert_cmds
+  revert_cmds=$(jq -r '(.revertCommands // [])[] | join(" ")' <<<"$payload") || die "bad payload"
+  moves=$(jq -c '.moves // []' <<<"$payload") || die "bad payload"
+  local expect
+  expect=$(jq -c '[(.expect // [])[] | {name: (.name | tostring), width: (.width | tonumber), height: (.height | tonumber),
+                    scale: (.scale | tonumber), transform: (.transform | tonumber), x: (.x | tonumber), y: (.y | tonumber),
+                    enabled: (.enabled != false), internal: (.internal == true), mirror: ((.mirror // "") | tostring)}]' <<<"$payload") || die "bad payload"
+  local reload_first
+  reload_first=$(jq -r '.reloadFirst // false' <<<"$payload") || die "bad payload"
+
+  lua_ok "$lua" || die "refusing Lua that is not a plain monitor rule"
+  lua_ok "$revert" || die "refusing revert Lua that is not a plain monitor rule"
+  local line
+  while IFS= read -r line; do [[ -z $line ]] || command_ok "$line" || die "refusing command: $line"; done <<<"$cmds"$'\n'"$revert_cmds"
+
+  private_dir "$RUN_DIR" && private_dir "$TOKEN_DIR" || die "cannot use $TOKEN_DIR"
+  [[ $(cmd_armed) == 0 ]] || die "a previous change is still waiting to be kept or reverted"
+  put_file "$TOKEN_DIR/$token.lua" "$revert" || die "cannot write the revert"
+  put_file "$TOKEN_DIR/$token.cmds" "$revert_cmds" || die "cannot write the revert"
+  put_file "$TOKEN_DIR/$token.expect" "$expect" || die "cannot write the revert"
+  rm -f -- "$TOKEN_DIR/$token.result"
+
+  # Detached, in its own session, so it outlives the shell.
+  setsid -f bash "$SELF" watchdog "$token" "$secs" </dev/null >/dev/null 2>&1
+  local waited=0
+  while [[ ! -e $TOKEN_DIR/$token.live ]] && (( waited < 20 )); do sleep 0.05; waited=$((waited + 1)); done
+  [[ -e $TOKEN_DIR/$token.live ]] || die "the revert watchdog did not start; nothing was changed"
+
+  code=0
+  out=""
+  # Workspace rules are only dropped by a reload, so a plan replacing them
+  # reloads first; the rules below then put every display where it belongs.
+  if [[ $reload_first == true ]]; then
+    "$HYPRCTL" reload >/dev/null 2>&1
+    sleep 0.4
+  fi
+  if [[ -n $lua ]]; then
+    out=$("$HYPRCTL" eval "$lua" 2>&1); code=$?
+    if (( code == 0 )) && grep -qi '^error' <<<"$out"; then code=7; fi
+  fi
+  if (( code == 0 )); then
+    while IFS= read -r line; do
+      [[ -z $line ]] && continue
+      # shellcheck disable=SC2086
+      $line >/dev/null 2>&1 || true
+    done <<<"$cmds"
+    run_moves "$moves"
+  fi
+  [[ -n $out ]] && printf '%s\n' "$out"
+  if (( code != 0 )); then
+    load_token
+    : >"$TOKEN_DIR/$token.done"
+    revert_now
+  fi
+  printf '%s%s\n' "$MARKER" "$code"
+}
+
+run_moves() {
+  local count i ws name
+  count=$(jq 'length' <<<"$1" 2>/dev/null) || return 0
+  for ((i = 0; i < count; i++)); do
+    ws=$(jq -r ".[$i].workspace" <<<"$1")
+    name=$(jq -r ".[$i].name" <<<"$1")
+    valid_int "$ws" && valid_name "$name" || continue
+    "$HYPRCTL" dispatch "hl.dsp.workspace.move({ workspace = \"$ws\", monitor = \"$name\" })" >/dev/null 2>&1
+  done
+}
+
+cmd_workspace_moves() {
+  run_moves "$(head -c 100000)"
+}
+
+# The service restoring a profile that was already kept: no countdown.
+cmd_eval_rules() {
+  local lua out code
+  lua=$(head -c 400000)
+  lua_ok "$lua" || die "refusing Lua that is not a plain monitor rule"
+  [[ -z $lua ]] && { printf '%s0\n' "$MARKER"; return; }
+  out=$("$HYPRCTL" eval "$lua" 2>&1); code=$?
+  if (( code == 0 )) && grep -qi '^error' <<<"$out"; then code=7; fi
+  [[ -n $out ]] && printf '%s\n' "$out"
+  printf '%s%s\n' "$MARKER" "$code"
+}
+
+cmd_revert() {
+  token="$1"
+  valid_token "$token" || die "usage: revert <token>"
+  private_dir "$RUN_DIR" && private_dir "$TOKEN_DIR" || die "cannot use $TOKEN_DIR"
+  load_token
+  : >"$TOKEN_DIR/$token.done"
+  local code=0
+  revert_now || code=1
+  rm -f -- "$TOKEN_DIR/$token.lua" "$TOKEN_DIR/$token.cmds" "$TOKEN_DIR/$token.expect"
+  printf '%s%s\n' "$MARKER" "$code"
+}
+
+# ------------------------------------------------------------------ keep
+
+# Saves monitors.lua from stdin when given, then stands the watchdog down.
+# Refuses when the file changed since it was read (the panel passes the
+# sha256 it read). Follows a symlink to the real file so a stowed dotfile
+# stays a symlink, but only to a regular .lua file we own.
+cmd_keep() {
+  token="$1"
+  local expect="$2" keep_n="$3" content target dir stamp tmp
+  valid_token "$token" || die "usage: keep <token> <sha|-> <backups>"
+  [[ $expect == "-" || $expect =~ ^[0-9a-f]{64}$ ]] || die "bad sha"
+  valid_int "$keep_n" && (( keep_n >= 1 && keep_n <= 50 )) || keep_n=10
+  content=$(cat; printf x)
+  content=${content%x}
+  private_dir "$RUN_DIR" && private_dir "$TOKEN_DIR" || die "cannot use $TOKEN_DIR"
+
+  if [[ -n $content ]]; then
+    (( ${#content} <= MAX_FILE_BYTES )) || { echo "monitors.lua would be too large"; printf '%s3\n' "$MARKER"; return; }
+    target="$MONITORS_LUA"
+    if [[ -L $target ]]; then
+      target=$(readlink -f -- "$target") || { printf '%s6\n' "$MARKER"; return; }
+      if [[ ! -f $target || ! -O $target || $target != *.lua ]]; then
+        echo "monitors.lua links to something other than a .lua file you own"
+        printf '%s6\n' "$MARKER"
+        return
+      fi
+    fi
+    if [[ $(sha_of "$target") != "$expect" ]]; then
+      echo "monitors.lua changed since it was read"
+      printf '%s4\n' "$MARKER"
+      return
+    fi
+    dir=$(dirname -- "$target")
+    mkdir -p -- "$dir" || { printf '%s5\n' "$MARKER"; return; }
+    stamp=$(date +%s)
+    if [[ -f $target ]]; then
+      cp -p -- "$target" "$dir/$BACKUP_PREFIX$stamp" || { echo "cannot write a backup"; printf '%s5\n' "$MARKER"; return; }
+    fi
+    tmp=$(mktemp -- "$target.omnidisplay.XXXXXX") || { printf '%s5\n' "$MARKER"; return; }
+    printf '%s' "$content" >"$tmp" || { rm -f -- "$tmp"; printf '%s5\n' "$MARKER"; return; }
+    if command -v luac >/dev/null 2>&1 && ! luac -p -- "$tmp" >/dev/null 2>&1; then
+      rm -f -- "$tmp"
+      echo "the new monitors.lua does not parse; nothing was saved"
+      printf '%s5\n' "$MARKER"
+      return
+    fi
+    [[ -f $target ]] && chmod --reference="$target" -- "$tmp" 2>/dev/null
+    mv -fT -- "$tmp" "$target" || { rm -f -- "$tmp"; printf '%s5\n' "$MARKER"; return; }
+    prune_backups "$dir" "$keep_n"
+  fi
+  : >"$TOKEN_DIR/$token.keep"
+  printf '%s0\n' "$MARKER"
+}
+
+prune_backups() {
+  local dir="$1" keep="$2" f
+  # shellcheck disable=SC2012
+  ls -1 -- "$dir" 2>/dev/null | grep -E "^${BACKUP_PREFIX//./\\.}[0-9]+$" | sort -t. -k4 -n -r | tail -n +"$((keep + 1))" |
+    while IFS= read -r f; do rm -f -- "$dir/$f"; done
+}
+
+# --------------------------------------------------------------- options
+
+cmd_options() {
+  local key out='{}' v
+  for key in misc:vrr general:allow_tearing render:direct_scanout render:cm_auto_hdr; do
+    v=$("$HYPRCTL" getoption "$key" -j 2>/dev/null | jq -c 'if has("bool") then .bool elif has("int") then .int else null end' 2>/dev/null)
+    [[ -n $v ]] || v=null
+    out=$(jq -c --arg k "${key/:/.}" --argjson v "$v" '. + {($k): $v}' <<<"$out")
+  done
+  echo "$out"
+}
+
+# ---------------------------------------------------------------- windows
+
+valid_address() { [[ $1 =~ ^0x[0-9a-f]{4,16}$ ]]; }
+
+cmd_windows() {
+  "$HYPRCTL" clients -j 2>/dev/null | jq -c '[.[] | select(.mapped != false and (.workspace.id // 0) > 0)
+    | {address, class, title: (.title[0:80]), workspace: .workspace.id, monitor, fullscreen}]'
+}
+
+# Moves the window to the workspace (one shown on a cast or tablet screen)
+# and makes it fullscreen there. return-window puts it back.
+cmd_send_window() {
+  local address="${1:-}" ws="${2:-}"
+  valid_address "$address" && valid_int "$ws" || die "usage: send-window <0xaddress> <workspace>"
+  "$HYPRCTL" dispatch "hl.dsp.window.move({ workspace = \"$ws\", window = \"address:$address\", follow = false })" >/dev/null 2>&1 || { printf '%s1\n' "$MARKER"; return; }
+  local fs
+  fs=$("$HYPRCTL" clients -j | jq -r --arg a "$address" '.[] | select(.address == $a) | .fullscreen')
+  [[ $fs == 0 ]] && "$HYPRCTL" dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", window = \"address:$address\" })" >/dev/null 2>&1
+  printf '%s0\n' "$MARKER"
+}
+
+cmd_return_window() {
+  local address="${1:-}" ws="${2:-}"
+  valid_address "$address" && valid_int "$ws" || die "usage: return-window <0xaddress> <workspace>"
+  local fs
+  fs=$("$HYPRCTL" clients -j | jq -r --arg a "$address" '.[] | select(.address == $a) | .fullscreen')
+  [[ -z $fs ]] && { printf '%s1\n' "$MARKER"; return; }
+  [[ $fs != 0 ]] && "$HYPRCTL" dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", window = \"address:$address\" })" >/dev/null 2>&1
+  "$HYPRCTL" dispatch "hl.dsp.window.move({ workspace = \"$ws\", window = \"address:$address\", follow = false })" >/dev/null 2>&1
+  printf '%s0\n' "$MARKER"
+}
+
+# After a sleep a panel can drop out of HDR while Hyprland goes on rendering
+# for it; switching to sRGB and back makes Hyprland send the metadata again.
+cmd_resend_hdr() {
+  local name="${1:-}" cm="${2:-}"
+  valid_name "$name" && [[ $cm =~ ^(hdr|hdredid)$ ]] || die "usage: resend-hdr <connector> <hdr|hdredid>"
+  "$HYPRCTL" eval "hl.monitor({ output = \"$name\", cm = \"srgb\" })" >/dev/null 2>&1
+  sleep 2
+  "$HYPRCTL" eval "hl.monitor({ output = \"$name\", cm = \"$cm\" })" >/dev/null 2>&1
+  printf '%s%s\n' "$MARKER" "$?"
+}
+
+# ----------------------------------------------------------------- store
+
+# profiles.json, from stdin. Must be a JSON object with a profiles array.
+cmd_store_write() {
+  local content
+  content=$(head -c 1000000)
+  jq -e 'type == "object" and (.profiles | type) == "array"' <<<"$content" >/dev/null 2>&1 || die "not a profiles store"
+  mkdir -p -- "$STATE_DIR" || die "cannot create $STATE_DIR"
+  [[ -d $STATE_DIR && ! -L $STATE_DIR ]] || die "refusing $STATE_DIR"
+  put_file "$STATE_DIR/profiles.json" "$content" || die "cannot write the store"
+  printf '%s0\n' "$MARKER"
+}
+
+# --------------------------------------------------------------- backups
+
+cmd_backups() {
+  local dir stamp f
+  dir=$(dirname -- "$(readlink -f -- "$MONITORS_LUA" 2>/dev/null || echo "$MONITORS_LUA")")
+  case "${1:-list}" in
+    list)
+      # shellcheck disable=SC2012
+      ls -1 -- "$dir" 2>/dev/null | grep -E "^${BACKUP_PREFIX//./\\.}[0-9]+$" | sort -t. -k4 -n -r |
+        while IFS= read -r f; do printf '%s\t%s\n' "${f##*.}" "$(wc -c <"$dir/$f")"; done
+      ;;
+    show)
+      stamp="${2:-}"
+      valid_stamp "$stamp" || die "usage: backups show <stamp>"
+      head -c "$MAX_FILE_BYTES" -- "$dir/$BACKUP_PREFIX$stamp"
+      ;;
+    restore)
+      stamp="${2:-}"
+      valid_stamp "$stamp" && [[ -f $dir/$BACKUP_PREFIX$stamp ]] || die "no such backup"
+      local now target
+      now=$(date +%s)
+      target=$(readlink -f -- "$MONITORS_LUA" 2>/dev/null || echo "$MONITORS_LUA")
+      [[ -f $target ]] && cp -p -- "$target" "$dir/$BACKUP_PREFIX$now"
+      local tmp
+      tmp=$(mktemp -- "$target.omnidisplay.XXXXXX") || die "cannot write"
+      cp -- "$dir/$BACKUP_PREFIX$stamp" "$tmp" && mv -fT -- "$tmp" "$target" || { rm -f -- "$tmp"; die "cannot restore"; }
+      "$HYPRCTL" reload >/dev/null 2>&1
+      printf '%s0\n' "$MARKER"
+      ;;
+    *) die "usage: backups list | show <stamp> | restore <stamp>" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ EDID
+
+cmd_edid() {
+  local name="${1:-}" f
+  valid_name "$name" || die "usage: edid <connector>"
+  for f in /sys/class/drm/card*-"$name"/edid; do
+    # sysfs reports size 0, so read a byte rather than trusting -s.
+    [[ -r $f ]] && [[ -n $(head -c 1 -- "$f" 2>/dev/null | od -An -tx1) ]] || continue
+    if command -v edid-decode >/dev/null 2>&1; then
+      edid-decode -- "$f" 2>/dev/null
+    else
+      echo "edid-decode-missing"
+    fi
+    return
+  done
+  echo "no-edid"
+}
+
+# ------------------------------------------------------------------- DDC
+
+# DDC/CI over ddcutil: brightness (0x10), contrast (0x12), input (0x60).
+cmd_ddc() {
+  command -v ddcutil >/dev/null 2>&1 || { echo '{"available":false,"displays":[]}'; return; }
+  case "${1:-}" in
+    detect)
+      ddcutil detect --terse 2>/dev/null | awk '
+        /^Display [0-9]+/ { valid = 1 }
+        /^Invalid display/ { valid = 0 }
+        /I2C bus:/ { bus = $NF; sub(/.*i2c-/, "", bus) }
+        /DRM connector:/ { conn = $NF; sub(/^card[0-9]+-/, "", conn); if (valid && bus != "") printf "%s %s\n", bus, conn; bus = "" }
+      ' | jq -Rn '{available: true, displays: [inputs | split(" ") | {bus: (.[0] | tonumber), connector: .[1]}]}'
+      ;;
+    get)
+      local bus="${2:-}"
+      valid_int "$bus" || die "usage: ddc get <bus>"
+      ddcutil --bus "$bus" --brief getvcp 10 12 60 2>/dev/null | awk '
+        $1 == "VCP" && $3 == "C" { v[$2] = $4; m[$2] = $5 }
+        $1 == "VCP" && $3 == "SNC" { v[$2] = $4 }
+        END {
+          printf "{\"brightness\":%s,\"brightnessMax\":%s,\"contrast\":%s,\"contrastMax\":%s,\"input\":\"%s\"}\n",
+            (v["10"] == "" ? -1 : v["10"]), (m["10"] == "" ? 100 : m["10"]),
+            (v["12"] == "" ? -1 : v["12"]), (m["12"] == "" ? 100 : m["12"]), v["60"]
+        }'
+      ;;
+    set)
+      local bus="${2:-}" vcp="${3:-}" value="${4:-}"
+      valid_int "$bus" && [[ $vcp =~ ^(10|12|60)$ ]] && [[ $value =~ ^(0x[0-9a-fA-F]{1,4}|[0-9]{1,5})$ ]] || die "usage: ddc set <bus> <10|12|60> <value>"
+      ddcutil --bus "$bus" --noverify setvcp "$vcp" "$value" >/dev/null 2>&1
+      printf '%s%s\n' "$MARKER" "$?"
+      ;;
+    *) die "usage: ddc detect | get <bus> | set <bus> <vcp> <value>" ;;
+  esac
+}
+
+# --------------------------------------------------------------- headless
+
+# Virtual outputs for tablets and screen sharing. Names are ours only, so a
+# remove can never take down a real display.
+cmd_headless() {
+  case "${1:-}" in
+    create)
+      local name="${2:-}" mode="${3:-}"
+      [[ $name =~ ^OMNI-[A-Z0-9]{1,12}$ ]] && valid_mode "$mode" || die "usage: headless create OMNI-<id> <WxH@R>"
+      "$HYPRCTL" output create headless "$name" >/dev/null 2>&1 || die "could not create $name"
+      local i=0
+      while (( i < 20 )); do
+        "$HYPRCTL" monitors all -j 2>/dev/null | jq -e --arg n "$name" 'any(.[]; .name == $n)' >/dev/null && break
+        sleep 0.1; i=$((i + 1))
+      done
+      # A complete rule, so no rule left from an earlier output of this name
+      # (mirroring, rotation, off) carries over.
+      "$HYPRCTL" eval "hl.monitor({ output = \"$name\", mode = \"$mode\", position = \"auto-right\", scale = 1, transform = 0, mirror = \"\", disabled = false })" >/dev/null 2>&1
+      printf '%s0\n' "$MARKER"
+      ;;
+    remove)
+      local name="${2:-}"
+      [[ $name =~ ^OMNI-[A-Z0-9]{1,12}$ ]] || die "usage: headless remove OMNI-<id>"
+      "$HYPRCTL" output remove "$name" >/dev/null 2>&1
+      printf '%s%s\n' "$MARKER" "$?"
+      ;;
+    list)
+      "$HYPRCTL" monitors all -j 2>/dev/null | jq -r '.[] | select(.name | test("^OMNI-")) | .name'
+      ;;
+    *) die "usage: headless create|remove|list" ;;
+  esac
+}
+
+# ------------------------------------------------------------ night light
+
+# hyprsunset, started on demand the way omarchy-toggle-nightlight does. A
+# fresh hyprsunset applies its own default at the end of its boot, so the
+# temperature is resent until it sticks.
+night_temp() {
+  local out
+  out=$("$HYPRCTL" hyprsunset temperature 2>/dev/null) || return 1
+  out=$(tr -d '[:space:]' <<<"$out")
+  [[ $out =~ ^[0-9]{3,5}$ ]] || return 1
+  echo "$out"
+}
+
+night_set() {
+  local want="$1" i
+  if ! pgrep -x hyprsunset >/dev/null 2>&1; then
+    command -v hyprsunset >/dev/null 2>&1 || return 1
+    if command -v uwsm-app >/dev/null 2>&1; then setsid -f uwsm-app -- hyprsunset >/dev/null 2>&1
+    else setsid -f hyprsunset >/dev/null 2>&1; fi
+  fi
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    "$HYPRCTL" hyprsunset temperature "$want" >/dev/null 2>&1
+    sleep 0.2
+    [[ $(night_temp) == "$want" ]] && break
+  done
+  omarchy-shell -q nightlight refresh 2>/dev/null
+  [[ $(night_temp) == "$want" ]]
+}
+
+cmd_night() {
+  local temp available=false
+  command -v hyprsunset >/dev/null 2>&1 && available=true
+  case "${1:-status}" in
+    status)
+      temp=$(night_temp) || temp=""
+      jq -cn --argjson available "$available" --arg t "$temp" \
+        '{available: $available, temperature: (($t | tonumber?) // 6500), enabled: ((($t | tonumber?) // 6500) < 6000)}'
+      ;;
+    on) night_set 4000; printf '%s%s\n' "$MARKER" "$?" ;;
+    off)
+      if pgrep -x hyprsunset >/dev/null 2>&1; then night_set 6500; printf '%s%s\n' "$MARKER" "$?"
+      else printf '%s0\n' "$MARKER"; fi
+      ;;
+    temperature)
+      temp="${2:-}"
+      valid_int "$temp" && (( temp >= 1000 && temp <= 10000 )) || die "usage: night temperature <1000-10000>"
+      night_set "$temp"
+      printf '%s%s\n' "$MARKER" "$?"
+      ;;
+    *) die "usage: night status|on|off|temperature <K>" ;;
+  esac
+}
+
+# ------------------------------------------------------- presentation mode
+
+# Keeps the screen awake and notifications quiet while presenting, and puts
+# both back exactly as they were afterwards.
+cmd_present() {
+  local saved="$RUN_DIR/present.saved" idle dnd
+  private_dir "$RUN_DIR" || die "cannot use $RUN_DIR"
+  case "${1:-status}" in
+    on)
+      if [[ ! -e $saved ]]; then
+        [[ -e $HOME/.local/state/omarchy/indicators/stay-awake ]] && idle=awake || idle=idle
+        dnd=$(omarchy-shell notifications isDnd 2>/dev/null || echo false)
+        put_file "$saved" "$idle $dnd"
+      fi
+      omarchy-toggle-idle stay-awake >/dev/null 2>&1
+      omarchy-shell -q notifications setDnd true
+      omarchy-shell -q omarchy.indicators refresh
+      printf '%s0\n' "$MARKER"
+      ;;
+    off)
+      if [[ -e $saved ]]; then
+        read -r idle dnd <"$saved"
+        [[ $idle == idle ]] && omarchy-toggle-idle allow-idle >/dev/null 2>&1
+        [[ $dnd == true ]] || omarchy-shell -q notifications setDnd false
+        rm -f -- "$saved"
+        omarchy-shell -q omarchy.indicators refresh
+      fi
+      printf '%s0\n' "$MARKER"
+      ;;
+    status) [[ -e $saved ]] && echo on || echo off ;;
+    *) die "usage: present on|off|status" ;;
+  esac
+}
+
+# ---------------------------------------------------------- terminal fonts
+
+# Per-terminal font size on top of Omarchy's global text size. Only the one
+# size line is touched, a backup is kept, and the value is checked first.
+term_conf() {
+  case "$1" in
+    alacritty) echo "$CONFIG_HOME/alacritty/alacritty.toml" ;;
+    kitty) echo "$CONFIG_HOME/kitty/kitty.conf" ;;
+    ghostty) echo "$CONFIG_HOME/ghostty/config" ;;
+    foot) echo "$CONFIG_HOME/foot/foot.ini" ;;
+  esac
+}
+
+term_size() {
+  local f
+  f=$(term_conf "$1")
+  [[ -f $f ]] || return 0
+  case "$1" in
+    alacritty) sed -nE 's/^[[:space:]]*size[[:space:]]*=[[:space:]]*([0-9.]+).*/\1/p' "$f" | head -n1 ;;
+    kitty) sed -nE 's/^[[:space:]]*font_size[[:space:]]+([0-9.]+).*/\1/p' "$f" | head -n1 ;;
+    ghostty) sed -nE 's/^[[:space:]]*font-size[[:space:]]*=[[:space:]]*([0-9.]+).*/\1/p' "$f" | head -n1 ;;
+    foot) sed -nE 's/^[[:space:]]*font[[:space:]]*=.*:size=([0-9.]+).*/\1/p' "$f" | head -n1 ;;
+  esac
+}
+
+cmd_terminal_font() {
+  local t f size
+  case "${1:-list}" in
+    list)
+      {
+        for t in alacritty kitty ghostty foot; do
+          f=$(term_conf "$t")
+          [[ -f $f ]] || continue
+          size=$(term_size "$t")
+          printf '%s\t%s\n' "$t" "${size:-}"
+        done
+      } | jq -Rn '[inputs | split("\t") | {terminal: .[0], size: ((.[1] | tonumber?) // null)}]'
+      ;;
+    set)
+      t="${2:-}"; size="${3:-}"
+      [[ $t =~ ^(alacritty|kitty|ghostty|foot)$ ]] || die "unknown terminal"
+      [[ $size =~ ^[0-9]{1,2}(\.[0-9])?$ ]] || die "size must be a number like 11 or 11.5"
+      f=$(term_conf "$t")
+      [[ -f $f ]] || die "no $t config"
+      local real
+      real=$(readlink -f -- "$f")
+      cp -p -- "$real" "$real.omnidisplay.bak" 2>/dev/null
+      case "$t" in
+        alacritty) sed -i -E "s/^([[:space:]]*size[[:space:]]*=[[:space:]]*)[0-9.]+/\1$size/" "$real" ;;
+        kitty) sed -i -E "s/^([[:space:]]*font_size[[:space:]]+)[0-9.]+/\1$size/" "$real"; pkill -USR1 -x kitty 2>/dev/null ;;
+        ghostty) sed -i -E "s/^([[:space:]]*font-size[[:space:]]*=[[:space:]]*)[0-9.]+/\1$size/" "$real"; pkill -USR2 -x ghostty 2>/dev/null ;;
+        foot) sed -i -E "s/^([[:space:]]*font[[:space:]]*=.*:size=)[0-9.]+/\1$size/" "$real" ;;
+      esac
+      printf '%s0\n' "$MARKER"
+      ;;
+    *) die "usage: terminal-font list | set <terminal> <size>" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- report
+
+cmd_report() {
+  echo "OmniDisplay report"
+  echo "date: $(date -u +%Y-%m-%dT%H:%MZ)"
+  echo "hyprland: $("$HYPRCTL" version 2>/dev/null | head -n1)"
+  echo "omarchy: $(omarchy-version 2>/dev/null || echo unknown)"
+  echo
+  echo "displays:"
+  "$HYPRCTL" monitors all -j 2>/dev/null | jq -r '.[] | "  \(.name): \(.make) \(.model) \(.width)x\(.height)@\(.refreshRate) scale \(.scale) at \(.x)x\(.y) transform \(.transform) \(if .disabled then "off" else "on" end) mirror \(.mirrorOf) cm \(.colorManagementPreset) format \(.currentFormat) vrr \(.vrr)"'
+  echo
+  echo "managed block in monitors.lua:"
+  sed -n '/^-- omnidisplay: begin$/,/^-- omnidisplay: end$/p' "$MONITORS_LUA" 2>/dev/null |
+    sed -E 's/(desc:[^"]*) [A-Za-z0-9]{6,}"/\1 <serial>"/g' | sed 's/^/  /'
+  echo
+  echo "tools:"
+  local t
+  for t in edid-decode ddcutil waycast doubletake wayvnc qrencode luac jq; do
+    printf '  %-12s %s\n' "$t" "$(command -v "$t" >/dev/null 2>&1 && echo yes || echo no)"
+  done
+}
+
+# ----------------------------------------------------------------- main
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  snapshot) cmd_snapshot ;;
+  apply) cmd_apply "${1:-}" "${2:-}" ;;
+  keep) cmd_keep "${1:-}" "${2:-}" "${3:-10}" ;;
+  revert) cmd_revert "${1:-}" ;;
+  watchdog) cmd_watchdog "${1:-}" "${2:-}" ;;
+  armed) cmd_armed ;;
+  eval-rules) cmd_eval_rules ;;
+  workspace-moves) cmd_workspace_moves ;;
+  store-write) cmd_store_write ;;
+  options) cmd_options ;;
+  windows) cmd_windows ;;
+  send-window) cmd_send_window "${1:-}" "${2:-}" ;;
+  return-window) cmd_return_window "${1:-}" "${2:-}" ;;
+  resend-hdr) cmd_resend_hdr "${1:-}" "${2:-}" ;;
+  backups) cmd_backups "$@" ;;
+  edid) cmd_edid "${1:-}" ;;
+  ddc) cmd_ddc "$@" ;;
+  headless) cmd_headless "$@" ;;
+  night) cmd_night "$@" ;;
+  present) cmd_present "$@" ;;
+  terminal-font) cmd_terminal_font "$@" ;;
+  report) cmd_report ;;
+  *) sed -n '3,30p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

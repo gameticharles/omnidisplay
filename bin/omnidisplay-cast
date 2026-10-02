@@ -1,0 +1,1445 @@
+#!/bin/bash
+
+# omarchy:summary=Cast backend for OmniDisplay (Miracast: waycast; AirPlay: doubletake)
+# omarchy:group=omnidisplay
+#
+# Ported from Filippo Veneri's omarchy-wireless-display (MIT); see NOTICE.
+# Its state lives in $XDG_RUNTIME_DIR/omnidisplay-cast, apart from the
+# original plugin's, so the two never share a session.
+#
+# One state file, two backends:
+#
+#   miracast  waycast   -- Wi-Fi Direct. A long-lived, blocking, single-session
+#                          process launched per connection and tailed for its
+#                          JSONL event stream.
+#   airplay   doubletake -- mDNS over the existing network. A daemon that holds
+#                          every stream itself; this script asks it for status
+#                          and folds the answer in. No tailer, no pid tracking.
+#
+# The two differ in what they can do at once, and that asymmetry is the whole
+# reason this file is shaped the way it is:
+#
+#   - At most ONE Miracast session. waycast owns the Wi-Fi P2P interface and,
+#     in extend mode, an edit to ~/.config/hypr/xdph.conf; two would fight over
+#     both. Connecting a second Miracast display is a switch, not an error.
+#   - Any number of AirPlay sessions. doubletake's daemon groups them by codec
+#     and canvas and fans one capture out to all of them.
+#   - The two can run together: they use different radios' worth of the same
+#     card but not the same interface. They do now share the portal config,
+#     which is why extend is serialised between them.
+#
+# Display ids are namespaced by protocol -- "miracast:<mac>", "airplay:<ip>" --
+# so the panel can hand one back without knowing which backend owns it, and the
+# two lists can never collide. Every entry also carries `address`, the bare
+# identifier its own backend wants.
+#
+# Known limitations:
+#   - Both backends can extend, and both do it by handing a virtual output to
+#     the screen-share portal through the same one-shot hook in
+#     ~/.config/hypr/xdph.conf. Only one may set that up at a time, so an
+#     AirPlay extend is refused while a Miracast session is live. Whether
+#     doubletake can extend at all is read from its daemon's advertised
+#     capabilities, never assumed from a version: an older one silently
+#     mirrors what it is asked to extend.
+#   - A receiver that wants a PIN or password is left waiting in `pending`
+#     with `awaiting` naming which of the two it asked for, and the panel
+#     prompts. The answer comes back on `credential <id>`'s stdin and goes
+#     straight to doubletake's socket, so it is never an argument anywhere.
+#     A wrong answer ends the stream -- doubletake does not re-prompt -- and
+#     the daemon's own message is surfaced.
+#   - `waycast daemon --sink X` re-discovers internally before connecting even
+#     though the scan already found X, so Miracast connects take a few extra
+#     seconds. waycast has no "connect directly" mode.
+#   - Neither backend reports signal strength; peers always carry signal=null.
+#   - If a Miracast disconnect has to fall back to SIGKILL, waycast's
+#     Drop-based cleanup (headless output removal, xdph.conf restore) does not
+#     run -- SIGKILL skips Rust Drop entirely.
+
+set -uo pipefail
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/omnidisplay-cast"
+STATE_FILE="$STATE_DIR/state.json"
+DAEMON_PID_FILE="$STATE_DIR/daemon.pid"
+SESSION_PID_FILE="$STATE_DIR/session.pid"
+SCAN_PID_FILE="$STATE_DIR/scan.pid"
+AIRPLAY_SCAN_PID_FILE="$STATE_DIR/airplay-scan.pid"
+DAEMON_LOG="$STATE_DIR/daemon.jsonl"
+DAEMON_ERR_LOG="$STATE_DIR/daemon.err"
+AIRPLAY_DAEMON_LOG="$STATE_DIR/airplay-daemon.log"
+AIRPLAY_DAEMON_PID_FILE="$STATE_DIR/airplay-daemon.pid"
+
+WAYCAST="${OMNIDISPLAY_CAST_WAYCAST_BIN:-waycast}"
+DOUBLETAKE="${OMNIDISPLAY_CAST_DOUBLETAKE_BIN:-doubletake}"
+DOUBLETAKE_CTL="${OMNIDISPLAY_CAST_DOUBLETAKE_CTL_BIN:-doubletake-ctl}"
+AIRPLAY_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/doubletake.sock"
+DISCOVER_TIMEOUT="${OMNIDISPLAY_CAST_DISCOVER_TIMEOUT:-8}"
+DISCONNECT_GRACE_SECONDS="${OMNIDISPLAY_CAST_DISCONNECT_GRACE_SECONDS:-10}"
+
+# Ceilings on everything the daemon can write. It used to write as much as it
+# liked: stdout and stderr went straight to two files that nothing truncated,
+# and `tail -F` followed one of them for the life of the session. That is not
+# a disk-space question -- $XDG_RUNTIME_DIR is a tmpfs, so it is the user's
+# RAM, and a process writing flat out fills the 3.1 GB one on this machine in
+# about a second.
+#
+# The numbers come from what a working session actually costs: seven events
+# totalling 353 bytes, start to finish. Four kilobytes a line and two hundred
+# events is three orders of magnitude of headroom and still bounds the JSONL
+# copy at under a megabyte.
+MAX_EVENT_BYTES="${OMNIDISPLAY_CAST_MAX_EVENT_BYTES:-4096}"
+MAX_EVENTS="${OMNIDISPLAY_CAST_MAX_EVENTS:-200}"
+MAX_STDERR_BYTES="${OMNIDISPLAY_CAST_MAX_STDERR_BYTES:-65536}"
+FLOOD_GRACE_SECONDS="${OMNIDISPLAY_CAST_FLOOD_GRACE_SECONDS:-2}"
+
+# doubletake's daemon log. It is not an event stream -- nothing parses it, it
+# is read only when something has gone wrong -- so it needs a ceiling and
+# nothing else.
+MAX_AIRPLAY_LOG_BYTES="${OMNIDISPLAY_CAST_MAX_AIRPLAY_LOG_BYTES:-65536}"
+
+# Ceiling on any single reply read into memory -- a backend's JSON on stdout,
+# or the AirPlay daemon's answer on its control socket. These are documents
+# parsed in one piece, not streams, so the ceiling has to sit above the largest
+# honest one and well below anything that matters: the biggest observed is a
+# discovery listing at a few hundred bytes per device.
+MAX_REPLY_BYTES="${OMNIDISPLAY_CAST_MAX_REPLY_BYTES:-262144}"
+
+# How long a backend gets to produce one of those replies. The socket calls are
+# local and answer in milliseconds; discovery is the slow one and gets its own
+# allowance where it is called.
+REPLY_TIMEOUT_SECONDS="${OMNIDISPLAY_CAST_REPLY_TIMEOUT_SECONDS:-15}"
+
+# Runs a backend and prints at most `max` bytes of what it says.
+#
+# Every reply this script reads comes from a separate program -- waycast,
+# doubletake, or doubletake's control socket -- and is parsed as one JSON
+# document. Read into a shell variable with no ceiling, a backend that is
+# broken, wedged or hostile can hand back gigabytes and take the panel's memory
+# with it. A timeout does not help: it bounds how long the reading waits, not
+# how much it keeps.
+#
+# `head -c` is the ceiling, and it is asked for one byte more than the ceiling
+# so that hitting it is detectable rather than a silent truncation -- a
+# truncated JSON document must never be parsed as if it were whole. On overflow
+# nothing is printed and the call fails, so a caller cannot use half an answer.
+#
+# `timeout` is what guarantees the producer stops. `head` closing the pipe ends
+# most of them at once, through SIGPIPE; a producer that ignores SIGPIPE -- any
+# Rust one does, waycast included -- would otherwise spin on EPIPE forever, and
+# the read would never return. With both, memory is bounded by the first and
+# termination by the second.
+bounded_run() {
+  local max=$1 secs=$2; shift 2
+  local out
+
+  out=$(LC_ALL=C timeout -k 2 "$secs" "$@" 2>/dev/null | LC_ALL=C head -c $((max + 1)))
+
+  if (( ${#out} > max )); then
+    echo "$1 produced more than ${max} bytes; discarding the reply" >&2
+    return 99
+  fi
+
+  printf '%s' "$out"
+}
+
+# waycast's own --interface default is "wlan0", the old kernel-numbered
+# naming; most current systems (predictable network interface naming) use
+# something like "wlp0s20f3" instead, so autodetect the real managed Wi-Fi
+# interface rather than trust that default. `OMNIDISPLAY_CAST_INTERFACE`
+# overrides it outright.
+# `iw dev` is kernel-derived and short, and the awk exits at the first match --
+# but it is still a separate program's output read into a variable, so it is
+# bounded like every other one rather than being the exception a reader has to
+# reason about.
+detect_wifi_interface() {
+  bounded_run 65536 10 iw dev \
+    | awk '/^[[:space:]]*Interface/{iface=$2} /type managed/{print iface; exit}'
+}
+WIFI_INTERFACE="${OMNIDISPLAY_CAST_INTERFACE:-$(detect_wifi_interface)}"
+WIFI_INTERFACE="${WIFI_INTERFACE:-wlan0}"
+
+mkdir -p "$STATE_DIR"
+
+# `pending` is a list for the same reason `connected` is: several AirPlay
+# receivers can be coming up at once. It holds at most one Miracast entry.
+# Each entry carries its own `mode`, because neither backend echoes back which
+# mode it was asked for.
+# `backends` records what each backend says it can do, so the panel offers a
+# mode only where one exists. It is learned from the running daemon rather
+# than assumed from a version or a package name, which is what doubletake's
+# own documentation asks of clients.
+EMPTY_STATE='{"status":"idle","errors":[],"notice":"","leaving":[],"scanning":false,"searched":false,"backends":{},"pending":[],"connected":[],"peers":[]}'
+
+STATE_LOCK="$STATE_DIR/state.lock"
+
+# This script re-invokes itself to apply daemon events, so it needs its own
+# path rather than relying on being on PATH.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+# `status` is derived, never assigned. It used to be set by hand at every
+# mutation site, which is workable with one session and not with several: a
+# connect landing while another display was already streaming had to know
+# which of "pairing" and "streaming" outranked the other. Deriving it from the
+# lists that actually changed leaves one rule in one place.
+#
+# Order matters. Discovery wins because it is the only state the user started
+# deliberately and can end; a connection in flight outranks a settled one,
+# since that is the thing still worth watching; an error only shows once
+# nothing is happening, so a failed connect does not mask a working display.
+# Errors are a list, newest first, and nothing but the user empties it.
+#
+# It was one string, and anything could overwrite or clear it: disconnecting,
+# the next poll, the panel starting up, a second failure landing a moment
+# after the first. Messages vanished before anyone could read them, let alone
+# copy them into a bug report. Now report() is the only way in, and the only
+# ways out are the ones the user takes -- dismissing, rescanning, starting a
+# new connect.
+#
+# Capped, because this is a status line and not a log; five is more than one
+# bad minute produces. The same message twice in a row is one entry, so a
+# condition noticed on consecutive polls does not fill the list by itself.
+#
+# `notice` is separate: something the user should know that is not a failure,
+# such as a connect that went ahead in a different mode than asked for.
+#
+# `leaving` holds tombstones: the ids of displays the user is ending on
+# purpose, each with an expiry. The reconcilers otherwise cannot tell a
+# session the user ended from one that dropped. The panel polls `state` every
+# two seconds from a process of its own, and a poll landing between the
+# backend letting go and our record of the display being removed saw a
+# display we held and the backend no longer had -- and reported it
+# disconnected, in red, as the answer to pressing disconnect. A poll that read
+# the backend just before the disconnect and wrote just after would bring the
+# display back instead. While a tombstone is live neither happens. It expires
+# rather than being removed, because the one thing it guards against is a
+# snapshot taken before the disconnect, and those are at most one reply
+# timeout old.
+RESTATUS='
+  def report($e):
+    if $e == "" or ((.errors // [])[0] == $e) then .
+    else .errors = (([$e] + (.errors // []))[:5]) end;
+  def leaving_ids: [(.leaving // [])[] | select(.until > now) | .id];
+  def mark_leaving($ids; $secs):
+    .leaving = ([(.leaving // [])[] | .id as $i | select(any($ids[]; . == $i) | not)]
+      + [$ids[] | {id: ., until: (now + $secs)}]);
+  def unmark_leaving($id): .leaving = [(.leaving // [])[] | select(.id != $id)];
+  def restatus:
+    # A state file from before errors were a list: fold its message in.
+    (if ((.error? // "") | type) == "string" and (.error? // "") != ""
+       then report(.error) else . end)
+    | del(.error)
+    | .errors = (.errors // [])
+    | .notice = (.notice // "")
+    | .leaving = [(.leaving // [])[] | select((.until // 0) > now)]
+    | .status = (
+      if .scanning then "discovering"
+      elif (.pending | length) > 0 then
+        (if any(.pending[]; .state == "negotiating") then "negotiating" else "pairing" end)
+      elif (.connected | length) > 0 then "streaming"
+      elif (.errors | length) > 0 then "error"
+      else "idle" end
+    );
+'
+
+read_state() {
+  if [[ -f $STATE_FILE ]]; then
+    cat "$STATE_FILE"
+  else
+    printf '%s' "$EMPTY_STATE"
+  fi
+}
+
+# Atomic: the panel polls this file twice a second, and a plain redirect
+# truncates before it writes, so a poll landing in that window reads an empty
+# file and parses as the default state -- a connected display flickering out
+# of the UI for one frame.
+write_state() {
+  local tmp="$STATE_FILE.$$"
+  printf '%s' "$1" >"$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+# Read-modify-write under a lock, with `status` re-derived afterwards.
+#
+# Every mutation goes through here. Without it, concurrent writers each read
+# the file, transform their own snapshot and write it back, so whichever
+# finishes last silently discards the other's change. That is not theoretical:
+# it is what left `status` at "streaming" while `pending` was never moved into
+# `connected`, so the panel showed a session it could not offer to disconnect.
+#
+# jq arguments are passed through, e.g.
+#   update_state 'report($e)' --arg e "..."
+update_state() {
+  local program=$1; shift
+  local fd
+  exec {fd}>>"$STATE_LOCK"
+  if flock -w 5 "$fd"; then
+    local current updated
+    current=$(read_state)
+    if updated=$(jq "$@" "$RESTATUS ($program) | restatus" <<<"$current" 2>/dev/null) \
+      && [[ -n $updated ]]; then
+      write_state "$updated"
+    else
+      echo "state update failed, leaving state untouched: $program" >&2
+    fi
+  else
+    echo "timed out waiting for the state lock; skipping update" >&2
+  fi
+  exec {fd}>&-
+}
+
+pid_alive() {
+  [[ -n ${1:-} ]] && kill -0 "$1" 2>/dev/null
+}
+
+# Tombstones the displays a jq filter selects from pending and connected, for
+# the given number of seconds. Further jq arguments pass through, so a filter
+# can name an id: mark_leaving 'select(.id == $id)' 60 --arg id "$id"
+mark_leaving() {
+  local filter=$1 secs=$2; shift 2
+  update_state "mark_leaving([(.pending + .connected)[] | $filter | .id]; \$secs)" \
+    --argjson secs "$secs" "$@"
+}
+
+kill_tracked() {
+  local pidfile=$1 signal=${2:-TERM}
+  [[ -f $pidfile ]] || return 0
+  local pid
+  pid=$(cat "$pidfile")
+  pid_alive "$pid" && kill "-$signal" "$pid" 2>/dev/null
+  rm -f "$pidfile"
+}
+
+# The session wrapper leads its own process group and everything the session
+# needs runs inside it -- the daemon, both bounded capture filters, and the
+# event reader -- so one signal to the group (the negative pid) takes all of
+# them. Signalling the wrapper alone used to leave the `tail` inside it
+# orphaned and still running: ten of them had accumulated, one per connect,
+# each replaying the log from the start whenever a new connect truncated it,
+# all writing state at once.
+kill_session_group() {
+  [[ -f $SESSION_PID_FILE ]] || return 0
+  local pid
+  pid=$(cat "$SESSION_PID_FILE")
+  if [[ -n $pid ]]; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  fi
+  rm -f "$SESSION_PID_FILE"
+}
+
+# --- identity ----------------------------------------------------------
+
+protocol_of() { printf '%s' "${1%%:*}"; }
+
+# Everything after the first colon. A Miracast address is itself full of
+# colons, so this cannot be a plain field split.
+address_of() { printf '%s' "${1#*:}"; }
+
+# --- shared predicates -------------------------------------------------
+
+# Something owns a backend when it is connected or being connected.
+#
+# This is the single rule for "is something in progress", derived from the
+# same two fields the panel reads. It replaces a `status != idle` test, which
+# was a third, subtly different rule: it also refused while status was
+# "error", so pressing rescan after a failed connect silently did nothing
+# while the panel -- which asks whether anything is connected, not what the
+# status string says -- offered the button as available.
+session_active() {
+  local state=${1:-$(read_state)}
+  [[ $(jq -r 'if ((.pending | length) > 0) or ((.connected | length) > 0) then "yes" else "no" end' \
+    <<<"$state") == yes ]]
+}
+
+has_protocol_session() {
+  local proto=$1 state=${2:-$(read_state)}
+  [[ $(jq -r --arg p "$proto" '
+        if any((.pending + .connected)[]; .protocol == $p) then "yes" else "no" end
+      ' <<<"$state") == yes ]]
+}
+
+# --- AirPlay: doubletake daemon ----------------------------------------
+
+airplay_available() { command -v "$DOUBLETAKE_CTL" >/dev/null 2>&1; }
+
+miracast_available() { command -v "$WAYCAST" >/dev/null 2>&1; }
+
+airplay_daemon_running() {
+  [[ -S $AIRPLAY_SOCKET ]] && "$DOUBLETAKE_CTL" status >/dev/null 2>&1
+}
+
+# doubletake's daemon runs continuous mDNS discovery, so it is started only
+# when the panel actually wants AirPlay -- on a scan or a connect -- and shut
+# down again when nothing is using it. Leaving it up would put a permanent
+# mDNS conversation on the network for a plugin the user may not have opened
+# in days.
+start_airplay_daemon() {
+  airplay_available || return 1
+  airplay_daemon_running && return 0
+  command -v "$DOUBLETAKE" >/dev/null 2>&1 || return 1
+
+  # Bounded like waycast's, and for the same reason: this is a tmpfs, so an
+  # unbounded log is the user's memory. Worse here, in fact -- the append this
+  # replaces never truncated, so the file grew across every session the
+  # machine had ever run rather than just the current one.
+  # A process substitution, not a pipe, for the same reason the Miracast
+  # wrapper uses one: `$!` has to be the daemon itself so it can be stopped
+  # later, and in a pipeline it would be the capture filter instead.
+  setsid bash -c '
+    self=$1; log=$2; pidfile=$3; max=$4; shift 4
+    "$@" -daemonize > >("$self" __bounded-capture "$log" "$max") 2>&1 &
+    daemon=$!
+    echo "$daemon" >"$pidfile"
+    wait "$daemon"
+  ' _ "$SELF" "$AIRPLAY_DAEMON_LOG" "$AIRPLAY_DAEMON_PID_FILE" \
+      "$MAX_AIRPLAY_LOG_BYTES" "$DOUBLETAKE" &
+  disown
+
+  # The socket appears before the daemon answers on it; wait for an answer.
+  # The pid file is written by the wrapper above, so it is waited for too --
+  # without it, a stop would have nothing to signal.
+  local waited=0
+  while (( waited < 50 )); do
+    if airplay_daemon_running && [[ -s $AIRPLAY_DAEMON_PID_FILE ]]; then
+      return 0
+    fi
+    sleep 0.1
+    (( waited++ ))
+  done
+  return 1
+}
+
+# Only a daemon this script started is stopped. One the user is running
+# themselves -- for the CLI, or for another client -- is left alone: it was
+# not ours to take down, and its streams are not ours to end.
+stop_airplay_daemon() {
+  [[ -f $AIRPLAY_DAEMON_PID_FILE ]] || return 0
+  has_protocol_session airplay && return 0
+
+  local pid
+  pid=$(cat "$AIRPLAY_DAEMON_PID_FILE")
+  rm -f "$AIRPLAY_DAEMON_PID_FILE"
+  pid_alive "$pid" || return 0
+  kill -TERM "$pid" 2>/dev/null
+
+  # Wait for it to be gone. SIGTERM returns at once, and a dying daemon goes
+  # on answering its socket for a moment -- long enough for the next
+  # start_airplay_daemon to decide one was already running, skip starting a
+  # replacement, and hand a connect a backend that then exited underneath it.
+  local waited=0
+  while pid_alive "$pid" && (( waited < 50 )); do
+    sleep 0.1
+    (( waited++ ))
+  done
+  # `&& kill` as the last statement would make this function -- and so
+  # `scan-stop` -- exit non-zero on the normal path, where the daemon has
+  # already gone and there is nothing left to kill.
+  pid_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+  return 0
+}
+
+# Folds `doubletake-ctl status` into our state.
+#
+# doubletake's daemon is the authority on its own streams, so this is a
+# reconciliation rather than an event feed: every AirPlay entry we hold is
+# checked against the daemon's list and made to agree with it. That covers
+# the cases a per-event stream would each need separate handling for -- a
+# stream that came up, one that failed, one that ended on the receiver's side,
+# and one started by some other doubletake client entirely.
+sync_airplay() {
+  local state
+  state=$(read_state)
+
+  # Nothing of ours to reconcile and no daemon to ask: leave the state alone
+  # rather than start a daemon just to be told there is nothing.
+  if ! airplay_daemon_running; then
+    has_protocol_session airplay "$state" || return 0
+
+    # Two different failures, and saying "the session ended" for both sent a
+    # bare install chasing a stream that never existed. The binary being
+    # absent is a setup problem; the daemon being absent while the binary is
+    # there is a crash.
+    local reason="The AirPlay session ended unexpectedly"
+    airplay_available || reason="AirPlay is unavailable: doubletake is not installed"
+
+    # A display being ended on purpose has not ended unexpectedly.
+    update_state '
+        leaving_ids as $gone
+        | any((.pending + .connected)[];
+            .protocol == "airplay" and (.id as $i | any($gone[]; . == $i) | not)) as $unexpected
+        | .pending = (.pending | map(select(.protocol != "airplay")))
+        | .connected = (.connected | map(select(.protocol != "airplay")))
+        | if $unexpected then report($err) else . end
+      ' --arg err "$reason"
+    return 0
+  fi
+
+  local resp
+  resp=$(bounded_run "$MAX_REPLY_BYTES" "$REPLY_TIMEOUT_SECONDS" "$DOUBLETAKE_CTL" status) || resp=""
+
+  local parsed
+  parsed=$(jq -c '{
+    streams: [.streams[]? | {
+      address: .device_ip,
+      name: (.device // .device_ip),
+      state: .state,
+      awaiting: (.credential_kind // ""),
+      # What the session actually negotiated, not what was asked for. Absent
+      # from a daemon predating per-session modes, where mirroring is all
+      # there was.
+      mode: (.mode // "mirror"),
+      # doubletake names its virtual output after a hash, which tells a user
+      # nothing; the size of the desktop they just gained tells them
+      # something, so that is what the detail line carries.
+      output: (.extend_size // "")
+    }],
+    error: (.error // ""),
+    caps: ((.capabilities // {}) as $c
+      | { extend: (($c.session_modes // []) | index("extend") != null),
+          per_session_mode: ($c.per_session_mode == true) })
+  }' <<<"$resp" 2>/dev/null)
+  [[ -z $parsed || $parsed == null ]] && parsed='{}'
+
+  # `live` is every AirPlay display the daemon says it has, rebuilt from
+  # scratch each time. A stream we never started is adopted rather than
+  # ignored: it is on the user's screen, so the panel should be able to say so
+  # and to end it.
+  update_state '
+      ($parsed.streams // []) as $streams
+      # The most recent asynchronous stream failure the daemon reports. It is
+      # cleared when a new connect to that target begins, so it is current for
+      # whatever just went away -- which is how a wrong PIN gets a message
+      # instead of a row that silently vanishes.
+      | ($parsed.error // "") as $derr
+      # A daemon that says nothing about its capabilities is an older one, and
+      # the answer is "unknown" rather than "no": both fields must be present
+      # and true before the panel offers a mode. Read on every status, so
+      # upgrading doubletake and restarting its daemon is all it takes to pick
+      # the mode up.
+      | ($parsed.caps // {extend: false, per_session_mode: false}) as $caps
+      # A tombstoned display is neither adopted, even if this reply still has
+      # it, nor reported when it goes: the user is ending it.
+      | leaving_ids as $gone
+      | ($streams | map(. + {
+          id: ("airplay:" + .address),
+          protocol: "airplay"
+        })
+        | map(select(.id as $i | any($gone[]; . == $i) | not))) as $live
+      | ($live | map(select(.state == "streaming"))) as $up
+      | ($live | map(select(.state != "streaming"))) as $coming
+      | ((.pending + .connected)
+          | map(select(.protocol == "airplay"))
+          | map(select(.address as $a | any($live[]; .address == $a) | not))
+          | map(select(.id as $i | any($gone[]; . == $i) | not))) as $dropped
+      | .connected = ((.connected | map(select(.protocol != "airplay")))
+          + ($up | map({id, name, protocol, address, mode, output})))
+      | .pending = ((.pending | map(select(.protocol != "airplay")))
+          + ($coming | map({id, name, protocol, address, mode, output, state: "pairing", awaiting})))
+      | .backends.airplay = ((.backends.airplay // {}) + $caps)
+      | .peers = (.peers | map(
+          if .protocol == "airplay" then
+            .address as $a
+            | .state = (if any($up[]; .address == $a) then "connected" else "available" end)
+          else . end))
+      | if ($dropped | length) > 0 then
+          report(if $derr != "" then $derr
+            else (($dropped | map(.name) | join(", ")) + " disconnected") end)
+        else . end
+    ' --argjson parsed "$parsed"
+}
+
+# One JSON request in, one JSON response out, over doubletake's control socket.
+#
+# Spoken directly rather than through `doubletake-ctl` for one reason: that
+# client takes the credential as an argument, and an argument is readable by
+# every local user with `ps`. Here the payload arrives on stdin and never
+# becomes anyone's argv. The protocol is small enough that this costs a dozen
+# lines; see internal/daemon/daemon.go handleConn in the doubletake tree.
+#
+# python3 rather than socat or nc: the AUR package already depends on python,
+# as do ufw and uwsm, so it is present wherever this plugin can run, and socat
+# is not.
+airplay_request() {
+  python3 -c '
+import socket, sys
+
+limit = int(sys.argv[2])
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(30)
+sock.connect(sys.argv[1])
+sock.sendall(sys.stdin.buffer.read())
+sock.shutdown(socket.SHUT_WR)
+
+# Bounded here rather than by the caller, because this is where the producer
+# can be stopped the instant the ceiling is crossed: closing the socket ends
+# the daemon writing to it. The timeout above limits how long this waits, not
+# how much it keeps, so it is no defence against a reply that simply never
+# stops -- which is what this loop is.
+reply = bytearray()
+overflowed = False
+while len(reply) <= limit:
+    chunk = sock.recv(4096)
+    if not chunk:
+        break
+    reply += chunk
+else:
+    overflowed = True
+
+sock.close()
+
+if overflowed or len(reply) > limit:
+    print("AirPlay control socket replied with more than %d bytes" % limit,
+          file=sys.stderr)
+    sys.exit(99)
+
+sys.stdout.buffer.write(bytes(reply))
+' "$AIRPLAY_SOCKET" "$MAX_REPLY_BYTES"
+}
+
+# Hands a PIN or password to a receiver that is waiting for one. The secret is
+# read from this script's stdin, never from an argument.
+#
+# doubletake treats this as resuming the connection that is already waiting, so
+# there is nothing to restart: the stream goes back to connecting and either
+# comes up or fails with a message, which sync_airplay then reports.
+cmd_credential() {
+  local display_id=${1:?display id required}
+  local protocol address secret payload reply
+
+  protocol=$(protocol_of "$display_id")
+  if [[ $protocol != airplay ]]; then
+    echo "credentials are an AirPlay notion; $display_id is $protocol" >&2
+    return 64
+  fi
+  address=$(address_of "$display_id")
+
+  IFS= read -r secret
+  if [[ -z $secret ]]; then
+    echo "no credential on stdin" >&2
+    return 64
+  fi
+
+  if ! airplay_daemon_running; then
+    update_state 'report("The AirPlay session ended before the code could be sent")'
+    return 1
+  fi
+
+  # jq -R takes the secret as raw text on its own stdin, and printf is a shell
+  # builtin, so the value passes from here to the socket without ever being an
+  # argument to a process.
+  payload=$(jq -Rc --arg t "$address" '{cmd: "connect", target: $t, pin: .}' <<<"$secret")
+  secret=""
+
+  # A refusal from the daemon is a JSON reply with `.ok` false; a reply that
+  # overran its ceiling is no reply at all, and airplay_request prints nothing
+  # in that case. Told apart here so the second does not report itself as the
+  # receiver rejecting the code.
+  if ! reply=$(printf '%s\n' "$payload" | airplay_request); then
+    payload=""
+    update_state 'report($err)' \
+      --arg err "The AirPlay backend sent an unusable reply; the code was not delivered"
+    return 1
+  fi
+  payload=""
+
+  if [[ $(jq -r '.ok // false' <<<"$reply" 2>/dev/null) != true ]]; then
+    local message
+    message=$(jq -r '.error // empty' <<<"$reply" 2>/dev/null)
+    [[ -z $message ]] && message="The display would not accept that code"
+    update_state 'report($err)' --arg err "$message"
+    return 1
+  fi
+
+  sync_airplay
+}
+
+# --- state -------------------------------------------------------------
+
+# Whether each backend is installed, refreshed on every read. It is the
+# binary that is tested, not a package -- someone running a self-built waycast
+# from a custom path through OMNIDISPLAY_CAST_WAYCAST_BIN has it, and
+# should not be told to go and install one.
+record_backend_presence() {
+  local mira=false air=false
+  miracast_available && mira=true
+  airplay_available && air=true
+
+  # Cheap to test, slow to change: a package is installed once, not twice a
+  # second. Comparing first keeps the steady state to a read, where writing
+  # unconditionally would take the lock and rewrite the file on every poll for
+  # a pair of booleans that are almost never new.
+  [[ $(jq -c '[.backends.miracast.installed, .backends.airplay.installed]' \
+        <<<"$(read_state)" 2>/dev/null) == "[$mira,$air]" ]] && return 0
+
+  update_state '
+      .backends.miracast = ((.backends.miracast // {}) + {installed: $m})
+      | .backends.airplay = ((.backends.airplay // {}) + {installed: $a})
+    ' --argjson m "$mira" --argjson a "$air"
+}
+
+cmd_state() {
+  # A state file from before errors were a list is brought up to date on the
+  # first read. Left to wait for some other write, its message would stay
+  # invisible -- the panel reads `errors`, and a poll may not write at all.
+  # `$(<file)` needs no external process, so the check is free every poll.
+  [[ -f $STATE_FILE && $(<"$STATE_FILE") != *'"errors"'* ]] && update_state '.'
+  record_backend_presence
+  reconcile_miracast
+  sync_airplay
+  read_state
+}
+
+# A Miracast session whose daemon has died leaves the state claiming a
+# connected display forever: SIGKILL skips waycast's teardown, so no "ended"
+# event is ever written, and the panel goes on offering a disconnect button
+# for a session that no longer exists. Notice and clear it, so the UI recovers
+# by itself rather than needing a manual disconnect.
+#
+# Only Miracast entries are touched. AirPlay has its own authority to ask
+# (sync_airplay) and its streams outlive any process this script tracks.
+reconcile_miracast() {
+  local state
+  state=$(read_state)
+  has_protocol_session miracast "$state" || return 0
+
+  # A session the user is ending has a daemon that is supposed to go away;
+  # the disconnect doing it cleans up after it.
+  [[ $(jq -r "$RESTATUS leaving_ids as \$g
+        | any((.pending + .connected)[]; .protocol == \"miracast\" and (.id as \$i | any(\$g[]; . == \$i)))" \
+        <<<"$state") == true ]] && return 0
+
+  if [[ -f $DAEMON_PID_FILE ]]; then
+    # A live daemon means the state is real, whatever it says.
+    pid_alive "$(cat "$DAEMON_PID_FILE")" && return 0
+  elif [[ $(jq -r 'any(.pending[]; .protocol == "miracast")' <<<"$state") == true ]]; then
+    # No pid file yet, but a connect is in flight -- cmd_connect writes the
+    # pending display before it has a pid to record. Do not race it.
+    return 0
+  fi
+
+  echo "the Miracast session's daemon is gone; resetting it" >&2
+  kill_session_group
+  update_state '
+      .pending = (.pending | map(select(.protocol != "miracast")))
+      | .connected = (.connected | map(select(.protocol != "miracast")))
+      | .peers = (.peers | map(if .protocol == "miracast" then .state = "available" else . end))
+      | report("The display session ended unexpectedly")
+    '
+  rm -f "$DAEMON_PID_FILE"
+}
+
+# --- discovery ---------------------------------------------------------
+
+# Both backends are scanned at once and each lands its own slice of `peers`
+# when it finishes, so the Wi-Fi Direct scan -- which takes seconds of radio
+# time -- never holds up the AirPlay list, which mDNS usually has within one.
+cmd_scan_start() {
+  # Discovery contends with an active session for the Wi-Fi radio, so it
+  # yields to one -- but anything else is a valid moment to look again. This
+  # now protects AirPlay too: a Wi-Fi Direct scan interrupts the very network
+  # an AirPlay stream is riding on.
+  session_active && return 0
+
+  kill_tracked "$SCAN_PID_FILE" TERM
+  kill_tracked "$AIRPLAY_SCAN_PID_FILE" TERM
+
+  # The list survives the scan that refreshes it. Clearing it here is what
+  # made opening the panel throw away the very thing it had just drawn: the
+  # popout appears correctly populated -- the state poll runs whether or not
+  # it is open -- and then, within one poll, empties for the eight seconds a
+  # scan takes. Old list, nothing, new list.
+  #
+  # Nothing goes stale by keeping it. `land_peers` replaces a protocol's
+  # entries wholesale when that protocol's scan finishes, so a display that
+  # has gone still disappears inside the same eight seconds; it just leaves no
+  # hole in the meantime.
+  #
+  # The worry this replaces -- that a stale list with no marking reads as a
+  # current one -- is answered by the panel rather than by emptying it: the
+  # hero says "Searching for displays…" and the rescan glyph pulses while a
+  # scan is in flight. An explicit rescan still starts from nothing, because
+  # there the user asked for a clean sweep; see cmd_rescan.
+  update_state '.scanning = true | .searched = false | .pending = []'
+
+  (
+    echo $BASHPID >"$SCAN_PID_FILE"
+    # Discovery is the one slow backend call, so it gets the scan window plus
+    # slack rather than the default reply timeout.
+    result=$(bounded_run "$MAX_REPLY_BYTES" "$((DISCOVER_TIMEOUT + 10))" \
+      "$WAYCAST" --json --interface "$WIFI_INTERFACE" discover --timeout "$DISCOVER_TIMEOUT") || result=""
+    peers=$(jq -c '[.devices[]? | {
+        id: ("miracast:" + .address),
+        address: .address,
+        name: (.name // .address),
+        protocol: "miracast",
+        signal: null,
+        state: "available"
+      }]' <<<"$result" 2>/dev/null)
+    [[ -z $peers || $peers == null ]] && peers='[]'
+    land_peers miracast "$peers"
+    rm -f "$SCAN_PID_FILE"
+    finish_scan
+  ) &
+  disown
+
+  (
+    echo $BASHPID >"$AIRPLAY_SCAN_PID_FILE"
+    if start_airplay_daemon; then
+      # `discover` returns whatever the daemon's continuous mDNS browse has
+      # found so far, so this polls rather than asking once: a daemon started
+      # by this very call has an empty cache, and how long the first responses
+      # take is the network's business, not ours. A single ask plus a fixed
+      # 1.5s wait reported an empty network against a receiver that was
+      # plainly there.
+      #
+      # It runs for the same window the Wi-Fi Direct scan does, and lands each
+      # time the list changes, so receivers appear as they answer instead of
+      # all at the end.
+      last='[]'
+      deadline=$(( SECONDS + DISCOVER_TIMEOUT ))
+      while (( SECONDS < deadline )); do
+        result=$(bounded_run "$MAX_REPLY_BYTES" "$REPLY_TIMEOUT_SECONDS" \
+          "$DOUBLETAKE_CTL" discover) || result=""
+        peers=$(jq -c '[.devices[]? | {
+            id: ("airplay:" + .ip),
+            address: .ip,
+            name: (.name // .ip),
+            protocol: "airplay",
+            signal: null,
+            state: "available"
+          }]' <<<"$result" 2>/dev/null)
+        [[ -z $peers || $peers == null ]] && peers='[]'
+        if [[ $peers != "$last" ]]; then
+          land_peers airplay "$peers"
+          last=$peers
+        fi
+        sleep 0.5
+      done
+    else
+      land_peers airplay '[]'
+    fi
+    rm -f "$AIRPLAY_SCAN_PID_FILE"
+    finish_scan
+  ) &
+  disown
+}
+
+# One protocol's results replace that protocol's peers and nothing else, so
+# the two scanners can finish in either order without overwriting each other.
+land_peers() {
+  local proto=$1 peers=$2
+  update_state '
+      if .scanning then
+        .peers = ((.peers | map(select(.protocol != $proto))) + $peers
+          | sort_by(.protocol, (.name | ascii_downcase)))
+      else . end
+    ' --arg proto "$proto" --argjson peers "$peers"
+}
+
+# Discovery is over once neither scanner is still running.
+finish_scan() {
+  [[ -f $SCAN_PID_FILE || -f $AIRPLAY_SCAN_PID_FILE ]] && return 0
+
+  # `searched` is set here and nowhere else: it means a scan ran to completion,
+  # which is what lets the panel say "No display found" rather than sitting
+  # silent on an empty list it has no news about. A scan the user cut short by
+  # closing the panel does not count -- stop_scanners leaves it alone.
+  update_state '.scanning = false | .searched = true'
+}
+
+# Ends discovery and nothing else. A connect wants exactly this: it is done
+# looking, but the AirPlay daemon it is about to talk to must stay up.
+#
+# What becomes of a list the scan had not finished depends on why it stopped.
+# A connect passes `keep`: the user has just picked one of those rows, so the
+# list is the one they chose from. Discarding it there took every other
+# display with it -- including the other half of a TV that speaks both
+# protocols, since the AirPlay scanner keeps polling for the whole scan window
+# however early its receivers answer -- and the display connected to vanished
+# too, the moment it was disconnected.
+#
+# The panel closing mid-scan still discards. It only scans on open when the
+# list is empty, so a half-done list left behind would be shown as if it were
+# the whole answer and never refreshed; dropping it means the next open looks
+# again.
+stop_scanners() {
+  local unfinished=${1:-discard}
+  kill_tracked "$SCAN_PID_FILE" TERM
+  kill_tracked "$AIRPLAY_SCAN_PID_FILE" TERM
+
+  if [[ $unfinished == keep ]]; then
+    update_state 'if .scanning then .scanning = false | .searched = false else . end'
+  else
+    update_state 'if .scanning then .scanning = false | .searched = false | .peers = [] else . end'
+  fi
+}
+
+# The panel closing: stop looking, and release a backend nothing is using.
+cmd_scan_stop() {
+  stop_scanners
+  stop_airplay_daemon
+}
+
+# --- Miracast: waycast events ------------------------------------------
+
+# Forwards the daemon's event stream, bounded three ways: each line is
+# truncated to max_line bytes, no more than max_events are forwarded, and the
+# on-disk copy can therefore hold no more than the two together allow.
+#
+# Past the cap it goes on *reading* and stops *writing*. A filter that exits
+# instead leaves the daemon blocked writing to a pipe nobody drains, and a
+# process blocked in a write may never reach the signal handler that would end
+# it -- which is the opposite of terminating the session safely. Observed
+# while prototyping this, with a stub that deadlocked exactly there.
+#
+# The one line it emits on breach is an event of its own, so the teardown is
+# the ordinary one rather than a second path that has to be kept correct.
+cmd_event_filter() {
+  local max_line=${1:?max line bytes required}
+  local max_events=${2:?max events required}
+  local out=${3:?log path required}
+
+  awk -v maxline="$max_line" -v maxevents="$max_events" -v out="$out" '
+    {
+      if (stopped) next
+      if (++seen > maxevents) {
+        stopped = 1
+        msg = "{\"event\":\"event_flood\"}"
+        print msg; fflush()
+        print msg > out; fflush(out)
+        next
+      }
+      line = substr($0, 1, maxline)
+      print line; fflush()
+      print line > out; fflush(out)
+    }'
+}
+
+# Keeps at most max bytes of a stream in a file, newest wins: at the cap the
+# file is truncated and filling starts again. stderr is only ever read after
+# the fact, so losing the oldest lines costs a little context, where letting
+# the file grow costs the user's memory.
+cmd_bounded_capture() {
+  local out=${1:?path required}
+  local max=${2:?max bytes required}
+
+  awk -v out="$out" -v max="$max" '
+    BEGIN { used = 0 }
+    {
+      line = substr($0, 1, 2048)
+      if (used + length(line) + 1 > max) { close(out); printf "" > out; used = 0 }
+      print line > out; fflush(out)
+      used += length(line) + 1
+    }'
+}
+
+# Ends a session whose daemon has run away, from outside that session's process
+# group -- `setsid`, because the teardown kills the group this would otherwise
+# be running in, and a teardown that kills itself half way through is not one.
+cmd_end_flooded_session() {
+  # A short grace, not the usual one. A daemon writing without end has already
+  # shown it is not going to shut down tidily, and every second of waiting is
+  # another second of it writing -- bounded, but still burning CPU and the
+  # user's battery. Measured against a stub that ignores SIGINT while
+  # flooding: 13 seconds to stop on the default grace, 3 on this one.
+  stop_miracast_session "$FLOOD_GRACE_SECONDS"
+  # Only the Miracast half is cleared. An AirPlay receiver can be streaming
+  # beside it, and it did nothing wrong.
+  update_state '
+      .pending = (.pending | map(select(.protocol != "miracast")))
+      | .connected = (.connected | map(select(.protocol != "miracast")))
+      | .peers = (.peers | map(if .protocol == "miracast" then .state = "available" else . end))
+      | report($err)
+    ' --arg err "The display session was ending badly and was stopped"
+}
+
+# Folds one line of `waycast --json daemon` output (see that fork's
+# crates/cli daemon_event_json) into the state file. Anything not
+# recognized is ignored rather than erroring -- forward-compatible with
+# waycast emitting event kinds this wrapper doesn't know about yet.
+#
+# Every program below addresses the Miracast entry specifically. waycast runs
+# one session, so "the pending Miracast display" is unambiguous, but it is no
+# longer "the pending display": an AirPlay receiver may be coming up beside it.
+apply_event() {
+  local line=$1
+  local event
+  event=$(jq -r '.event // empty' <<<"$line" 2>/dev/null)
+  [[ -z $event ]] && return 0
+
+  case "$event" in
+    started)
+      update_state '.pending = (.pending | map(if .protocol == "miracast" then .state = "pairing" else . end))'
+      ;;
+    connected|negotiated)
+      update_state '.pending = (.pending | map(if .protocol == "miracast" then .state = "negotiating" else . end))'
+      ;;
+    virtual_output_created)
+      local output_name
+      output_name=$(jq -r '.name // empty' <<<"$line")
+      # Mirroring creates no virtual output, so this never fires for it and
+      # the display's `output` stays empty -- which is correct, not missing.
+      [[ -n $output_name ]] && update_state \
+        '.pending = (.pending | map(if .protocol == "miracast" then .output = $out else . end))' \
+        --arg out "$output_name"
+      ;;
+    streaming_started)
+      # The in-flight display becomes a connected one. Its mode came from the
+      # connect call, not from waycast, which is why we carried it here.
+      update_state '
+          (.pending | map(select(.protocol == "miracast"))) as $up
+          | .connected += ($up | map(del(.state)))
+          | .pending = (.pending | map(select(.protocol != "miracast")))
+          | .peers = (.peers | map(
+              .id as $i
+              | if any($up[]; .id == $i) then .state = "connected" else . end))
+        '
+      ;;
+    error)
+      local message
+      message=$(jq -r '.message // "Connection failed"' <<<"$line")
+      # Reported only when it is about a session nobody is ending. waycast
+      # can complain on its way down, and a session the user ended -- or one
+      # already gone from the state by the time a late event lands -- has
+      # nobody left to tell.
+      update_state '
+          leaving_ids as $gone
+          | (if any((.pending + .connected)[];
+                .protocol == "miracast" and (.id as $i | any($gone[]; . == $i) | not))
+             then report($err) else . end)
+          | .pending = (.pending | map(select(.protocol != "miracast")))
+        ' --arg err "$message"
+      ;;
+    event_flood)
+      # The filter's own signal that the daemon is writing without end. Keep
+      # the message short: what matters is that the session stops.
+      echo "the display daemon flooded its event stream; ending the session" >&2
+      setsid "$SELF" __end-flooded-session >/dev/null 2>&1 &
+      disown
+      ;;
+    ended)
+      # A prior "error" event already told the story; don't clobber it with a
+      # bare reset once the (now-exiting) daemon process catches up.
+      update_state '
+          .pending = (.pending | map(select(.protocol != "miracast")))
+          | .connected = (.connected | map(select(.protocol != "miracast")))
+          | .peers = (.peers | map(if .protocol == "miracast" then .state = "available" else . end))
+        '
+      rm -f "$DAEMON_PID_FILE"
+      ;;
+  esac
+}
+
+# --- connect / disconnect ----------------------------------------------
+
+# Record the display a connect is about to start, and with it any notice
+# saying the mode is not the one that was asked for. The notice also goes to
+# stderr, since from a terminal that is the only place anyone would see it.
+#
+# Both backends come through here because they did not, once. The notice was
+# added as two hand-copied edits and the copies drifted -- connect_airplay
+# computed a notice and then wrote an empty error over it, while
+# connect_miracast wrote a $notice it never declared, which under `set -u`
+# aborted every Miracast connect before waycast was ever reached. One copy
+# cannot disagree with itself.
+record_pending() {
+  local peer=$1 mode=$2 notice=${3:-}
+  [[ -n $notice ]] && echo "$notice" >&2
+  # A fresh attempt at a display is no longer one being ended, however
+  # recently it was.
+  update_state '
+      unmark_leaving($peer.id)
+      | .notice = $notice
+      | .pending += [$peer + {mode: $mode, output: "", state: "pairing"}]
+    ' --argjson peer "$peer" --arg mode "$mode" --arg notice "$notice"
+}
+
+cmd_connect() {
+  local display_id=${1:?display id required}
+  local mode=${2:-mirror}
+
+  case "$mode" in
+    extend|mirror) ;;
+    *) echo "unknown mode '$mode' (expected 'extend' or 'mirror')" >&2; return 64 ;;
+  esac
+
+  local current peer protocol address
+  current=$(read_state)
+  peer=$(jq --arg id "$display_id" '[.peers[] | select(.id == $id)][0]' <<<"$current")
+  if [[ $peer == null ]]; then
+    update_state 'report($err)' --arg err "Unknown display $display_id"
+    return 1
+  fi
+
+  # One connect at a time, whichever backend. Both reach for the screencast
+  # portal while they set up, and waycast arms a one-shot picker override for
+  # its headless output moments before its own request -- a second connect
+  # landing in that window can consume the override and be handed waycast's
+  # output instead of the screen it asked for.
+  if [[ $(jq -r '(.pending | length) > 0' <<<"$current") == true ]]; then
+    echo "another display is still connecting" >&2
+    return 1
+  fi
+
+  # A new attempt is the user moving on from whatever went wrong before, so
+  # old messages go -- here, before anything of this attempt's own can fail,
+  # so that a refusal a few lines down is the only thing on the list.
+  update_state '.errors = [] | .notice = ""'
+
+  protocol=$(protocol_of "$display_id")
+  address=$(address_of "$display_id")
+
+  case "$protocol" in
+    miracast) connect_miracast "$peer" "$address" "$mode" ;;
+    airplay)  connect_airplay "$peer" "$address" "$mode" ;;
+    *) echo "unknown protocol '$protocol'" >&2; return 64 ;;
+  esac
+}
+
+connect_miracast() {
+  local peer=$1 address=$2 mode=$3
+
+  # Still one Miracast session at a time. But pairing with a different display
+  # is a switch, not an error: end the current session first and carry on. The
+  # peer was captured by the caller, before this teardown, precisely so the
+  # discovered list can be preserved across it.
+  if has_protocol_session miracast; then
+    local previous
+    previous=$(jq -r '[.connected[] | select(.protocol == "miracast") | .name] | join(", ")' <<<"$(read_state)")
+    [[ -n $previous ]] && echo "switching away from $previous" >&2
+    mark_leaving 'select(.protocol == "miracast")' "$((DISCONNECT_GRACE_SECONDS + 30))"
+    stop_miracast_session
+    update_state '
+        .connected = (.connected | map(select(.protocol != "miracast")))
+        | .pending = (.pending | map(select(.protocol != "miracast")))
+        | .peers = (.peers | map(if .protocol == "miracast" then .state = "available" else . end))
+      '
+  fi
+
+  stop_scanners keep
+
+  record_pending "$peer" "$mode"
+
+  # --extend creates a headless output and streams that. Without it waycast
+  # mirrors an existing output, which it picks through the desktop portal --
+  # so mirroring shows the portal's screen-share dialog, because nothing
+  # arms waycast's one-shot picker override outside extend mode.
+  local -a mode_args=()
+  [[ $mode == extend ]] && mode_args+=(--extend)
+
+  kill_session_group
+  # A tailer left behind by a version of this script that predates the
+  # bounded pipeline below. Harmless once, and it would otherwise go on
+  # following a log nothing writes any more.
+  pkill -f "tail -n \\+1 -F $DAEMON_LOG" 2>/dev/null || true
+
+  : >"$DAEMON_LOG"
+  : >"$DAEMON_ERR_LOG"
+
+  # The daemon's output is piped, not spooled. It used to be written to two
+  # files with no ceiling and read back with `tail -F`; nothing needed it on
+  # disk, and the file was the whole exposure. Now stdout goes through a
+  # filter that bounds it three ways and hands each event straight to the
+  # reader, and stderr through a capture that keeps only its tail.
+  #
+  # One process group holds the daemon, both filters and the reader, so
+  # teardown takes all of them at once -- while the daemon's own pid is
+  # recorded separately, because ending a session means SIGINT to waycast
+  # specifically, so its Drop-based cleanup runs.
+  #
+  # `$!` inside the wrapper is the daemon itself and not the last stage of a
+  # pipeline, which is why the redirections are process substitutions rather
+  # than `|`.
+  setsid bash -c '
+    self=$1; log=$2; errlog=$3; pidfile=$4
+    max_line=$5; max_events=$6; max_err=$7
+    shift 7
+
+    "$@" \
+      > >("$self" __event-filter "$max_line" "$max_events" "$log" \
+            | while IFS= read -r line; do "$self" __apply-event "$line"; done) \
+      2> >("$self" __bounded-capture "$errlog" "$max_err") &
+    daemon=$!
+    echo "$daemon" >"$pidfile"
+    wait "$daemon"
+  ' _ "$SELF" "$DAEMON_LOG" "$DAEMON_ERR_LOG" "$DAEMON_PID_FILE" \
+      "$MAX_EVENT_BYTES" "$MAX_EVENTS" "$MAX_STDERR_BYTES" \
+      "$WAYCAST" --json --interface "$WIFI_INTERFACE" daemon --sink "$address" \
+      "${mode_args[@]}" --audio &
+  echo $! >"$SESSION_PID_FILE"
+  disown -a
+}
+
+connect_airplay() {
+  local peer=$1 address=$2 mode=$3
+
+  # doubletake gained extend, but only where the daemon says so: an older one
+  # silently mirrors whatever it is asked for, which would leave the panel
+  # claiming a second desktop that never appeared.
+  # Handed to record_pending, which records it with the display it is about.
+  local notice=""
+  local caps
+  caps=$(jq -c '.backends.airplay // {}' <<<"$(read_state)")
+  if [[ $mode == extend ]]; then
+    if [[ $(jq -r '.extend == true and .per_session_mode == true' <<<"$caps") != true ]]; then
+      notice="This doubletake cannot extend; mirroring instead. Update doubletake for extend support."
+      mode=mirror
+    fi
+  fi
+
+  # Both backends install a one-shot picker override into
+  # ~/.config/hypr/xdph.conf to hand their virtual output to the portal, and
+  # doubletake's first extend rewrites that file and restarts the portal --
+  # which its own documentation says to do only with no Waycast session
+  # running. Refusing is better than interrupting a working stream.
+  if [[ $mode == extend ]] && has_protocol_session miracast; then
+    update_state 'report($err)' \
+      --arg err "Disconnect the Miracast display first: both use the same screen-share hook, and setting up AirPlay extend would interrupt it."
+    return 1
+  fi
+
+  stop_scanners keep
+
+  if ! start_airplay_daemon; then
+    update_state 'report($err)' \
+      --arg err "AirPlay is unavailable: doubletake is not installed or would not start"
+    return 1
+  fi
+
+  record_pending "$peer" "$mode" "$notice"
+
+  # Failure is read from the reply rather than from an exit status: the status
+  # now belongs to bounded_run, and doubletake prints its refusal as JSON on
+  # stdout before exiting non-zero anyway, so `.ok` is the more direct answer.
+  local out
+  # The mode is a flag, so it goes before the subcommand.
+  if ! out=$(bounded_run "$MAX_REPLY_BYTES" "$REPLY_TIMEOUT_SECONDS" \
+      "$DOUBLETAKE_CTL" -mode "$mode" connect "$address") \
+    || [[ $(jq -r '.ok // false' <<<"$out" 2>/dev/null) != true ]]; then
+    local message
+    message=$(jq -r '.error // empty' <<<"$out" 2>/dev/null)
+    [[ -z $message ]] && message="Could not start the AirPlay stream"
+    update_state '
+        report($err)
+        | .pending = (.pending | map(select(.address != $addr)))
+      ' --arg err "$message" --arg addr "$address"
+    return 1
+  fi
+
+  # doubletake's connect returns as soon as the stream is queued; the daemon
+  # carries it the rest of the way. One sync here so a fast receiver -- the
+  # Apple TV takes about two seconds -- shows as connected without waiting for
+  # the panel's next poll.
+  sleep 2
+  sync_airplay
+}
+
+# Ends the Miracast session and returns once it is really gone, leaving the
+# state file alone. Separate from cmd_disconnect because switching displays
+# has to tear the old session down while keeping the discovered list -- a
+# full reset there would empty the list the user just clicked in.
+# Takes an optional grace, in seconds, to wait for the daemon to end itself
+# before it is killed outright. The default is generous because a healthy
+# teardown is worth waiting for; a caller that already knows the daemon is
+# misbehaving passes something short.
+stop_miracast_session() {
+  local grace=${1:-$DISCONNECT_GRACE_SECONDS}
+
+  if [[ -f $DAEMON_PID_FILE ]]; then
+    local pid
+    pid=$(cat "$DAEMON_PID_FILE")
+    if pid_alive "$pid"; then
+      # SIGINT, not SIGTERM/SIGKILL: waycast's run() waits on
+      # tokio::signal::ctrl_c() specifically to trigger its own graceful
+      # teardown (stop stream, P2P disconnect, remove the headless output,
+      # restore xdph.conf). Give that real time before giving up on it.
+      kill -INT "$pid" 2>/dev/null
+      local waited=0
+      while pid_alive "$pid" && (( waited < grace * 5 )); do
+        sleep 0.2
+        (( waited++ ))
+      done
+      # Last resort. Skips waycast's Drop-based cleanup entirely (SIGKILL
+      # doesn't unwind) -- see the header comment's known-limitations note.
+      pid_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+    fi
+    rm -f "$DAEMON_PID_FILE"
+  fi
+
+  kill_session_group
+}
+
+# With an id, ends that one display. Without, ends everything -- which is what
+# rescan and a panel-wide "stop" need, and what a user pressing disconnect on
+# the last display gets either way.
+cmd_disconnect() {
+  local display_id=${1:-}
+
+  # Every branch tombstones what it ends before telling a backend: once the
+  # backend has let go, any poll could notice, and it must find a display the
+  # user is ending rather than one that dropped. The tombstone is renewed once
+  # our record is gone, from then on covering a poll that read the backend
+  # before the disconnect and writes after it.
+  local settle=$((REPLY_TIMEOUT_SECONDS + 5))
+
+  if [[ -z $display_id ]]; then
+    mark_leaving '.' "$((DISCONNECT_GRACE_SECONDS + REPLY_TIMEOUT_SECONDS + 30))"
+    stop_miracast_session
+    airplay_daemon_running && "$DOUBLETAKE_CTL" disconnect >/dev/null 2>&1
+    mark_leaving '.' "$settle"
+    update_state '
+        .pending = []
+        | .connected = []
+        | .peers = (.peers | map(.state = "available"))
+      '
+    stop_airplay_daemon
+    return 0
+  fi
+
+  local protocol address
+  protocol=$(protocol_of "$display_id")
+  address=$(address_of "$display_id")
+
+  case "$protocol" in
+    miracast)
+      mark_leaving 'select(.protocol == "miracast")' "$((DISCONNECT_GRACE_SECONDS + 30))"
+      stop_miracast_session
+      update_state '
+          .pending = (.pending | map(select(.protocol != "miracast")))
+          | .connected = (.connected | map(select(.protocol != "miracast")))
+          | .peers = (.peers | map(if .protocol == "miracast" then .state = "available" else . end))
+        '
+      ;;
+    airplay)
+      # Dropping our record before this function's own reconcile was not
+      # enough. The panel's poll reconciles too, from a process of its own,
+      # and one landing between the daemon letting go and this record going
+      # put "Apple TV disconnected" on the error line as the answer to
+      # pressing disconnect. The tombstone covers that window and the one
+      # after it.
+      mark_leaving 'select(.id == $id)' "$((REPLY_TIMEOUT_SECONDS + 30))" --arg id "$display_id"
+      airplay_daemon_running && "$DOUBLETAKE_CTL" disconnect "$address" >/dev/null 2>&1
+      mark_leaving 'select(.id == $id)' "$settle" --arg id "$display_id"
+
+      update_state '
+          .pending = (.pending | map(select(.id != $id)))
+          | .connected = (.connected | map(select(.id != $id)))
+          | .peers = (.peers | map(if .id == $id then .state = "available" else . end))
+        ' --arg id "$display_id"
+
+      sync_airplay
+      stop_airplay_daemon
+      ;;
+    *) echo "unknown protocol '$protocol'" >&2; return 64 ;;
+  esac
+}
+
+# Who is calling, as "<pid>:<start time>": the start time keeps a recycled pid
+# from passing for the process that had it before. Empty if it cannot be read.
+caller_identity() {
+  local stat
+  stat=$(<"/proc/$PPID/stat") 2>/dev/null || return 0
+  # The command name sits in parentheses and may contain spaces, so fields are
+  # counted from after it. The start time is field 22 overall, the 20th here.
+  local -a rest
+  read -ra rest <<<"${stat##*) }"
+  printf '%s:%s' "$PPID" "${rest[19]}"
+}
+
+# Forgets what discovery found, leaving any live session alone.
+#
+# The panel calls this as it starts, so a list from a previous run of the
+# shell -- the state file outlives it, living in the runtime directory -- is
+# not presented as the result of a scan this session never ran. A connected
+# display is not discovery's to forget and stays, and neither do errors: the
+# user has not read them just because the shell restarted.
+#
+# With --once it does this once per caller, and the panel passes it. "As the
+# panel starts" is not once per shell: the shell builds a bar for every
+# monitor, so a new monitor brings a new copy of this widget, which starts
+# too. Extending creates exactly such a monitor -- doubletake's virtual output
+# or waycast's headless one -- so connecting in extend mode reset the list
+# from underneath the connect, and the other displays vanished the moment it
+# was made. Every copy runs under the same shell process, which is what the
+# caller identity records.
+cmd_reset_list() {
+  if [[ ${1:-} == --once ]]; then
+    local caller
+    caller=$(caller_identity)
+    update_state '
+        if $caller != "" and .reset_by == $caller then .
+        else .peers = [] | .searched = false | .reset_by = $caller end
+      ' --arg caller "$caller"
+    return 0
+  fi
+  update_state '.peers = [] | .searched = false'
+}
+
+# The dismiss button. With rescan and a new connect, one of the only three
+# things that empty the error list.
+cmd_clear_errors() {
+  update_state '.errors = [] | .notice = ""'
+}
+
+# Discovery, from any state. Unlike scan-start -- which yields to a running
+# session so that merely opening the panel cannot kill a working stream --
+# this ends every session first, because the user asked for it explicitly and
+# the panel has already warned them what it costs.
+# This is the one place the list is thrown away, and the only one where that
+# is what the user asked for: rescan means "forget what you found and look
+# again", and the panel has already warned that it ends any session.
+cmd_rescan() {
+  cmd_disconnect
+  # Tombstones survive the reset: the sessions just ended are exactly what
+  # they are there to cover. So does the record of which shell reset the
+  # list, or the next monitor to appear would reset it again.
+  update_state '$empty + {leaving: .leaving, reset_by: .reset_by}' --argjson empty "$EMPTY_STATE"
+  cmd_scan_start
+}
+
+case "${1:-}" in
+  state) cmd_state ;;
+  scan-start) cmd_scan_start ;;
+  rescan) cmd_rescan ;;
+  scan-stop) cmd_scan_stop ;;
+  reset-list) cmd_reset_list "${2:-}" ;;
+  clear-errors) cmd_clear_errors ;;
+  # Internal: the event tailer re-invokes the script per line so each event
+  # is folded in under the state lock.
+  __apply-event) apply_event "${2:-}" ;;
+  # Internal: the bounded capture filters the session wrapper pipes through,
+  # and the detached teardown one of them can ask for.
+  __event-filter) cmd_event_filter "${2:-}" "${3:-}" "${4:-}" ;;
+  __bounded-capture) cmd_bounded_capture "${2:-}" "${3:-}" ;;
+  __end-flooded-session) cmd_end_flooded_session ;;
+  connect) cmd_connect "${2:-}" "${3:-mirror}" ;;
+  credential) cmd_credential "${2:-}" ;;
+  mirror) cmd_connect "${2:-}" mirror ;;
+  extend) cmd_connect "${2:-}" extend ;;
+  disconnect) cmd_disconnect "${2:-}" ;;
+  *)
+    cat >&2 <<'USAGE'
+usage: omnidisplay-cast <command>
+
+  state                     print the panel's state as JSON
+  scan-start                begin discovery on every backend
+  scan-stop                 end discovery
+  rescan                    end every session, clear the list, and scan again
+  reset-list [--once]       forget discovered displays, keeping any session;
+                            with --once, only the first time for a given caller
+  clear-errors              dismiss every error message and notice
+  connect <id> [mode]       connect; mode is "mirror" (default) or "extend".
+                            Extend over AirPlay needs a daemon advertising it,
+                            and no live Miracast session; without the first it
+                            mirrors and says so, without the second it fails.
+  credential <id>           hand a waiting AirPlay receiver its PIN or
+                            password, read from stdin. AirPlay only.
+  mirror <id>               shorthand for: connect <id> mirror
+  extend <id>               shorthand for: connect <id> extend
+  disconnect [id]           end that display's session, or every session when
+                            no id is given
+
+Display ids are namespaced by protocol: "miracast:<mac>", "airplay:<ip>".
+USAGE
+    exit 64
+    ;;
+esac

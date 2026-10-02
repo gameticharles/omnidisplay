@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Library tests
+        run: node tests/lib.test.js
+
+      - name: Control script tests
+        run: bash tests/ctl.test.sh
+
+      - name: Shell syntax
+        run: for f in bin/*; do bash -n "$f"; done
+
+      - name: Manifest
+        run: jq -e '.schemaVersion == 1 and .id == "omnidisplay"' manifest.json
