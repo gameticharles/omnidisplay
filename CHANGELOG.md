@@ -4,7 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.1] - 2026-10-05
+
+### Fixed
+
+- Display modes with a TV cast as the second screen. Mirror, Built-in only,
+  switching the screen off and the workspace plan all seemed to do nothing:
+  - A kept "Built-in only" was written as a rule switching the cast's
+    virtual screen (HEADLESS-1) off, and Hyprland and the automatic restore
+    re-applied it at every reload and display change, so the TV went on
+    showing its last frame of the desktop. A cast's screen is no longer
+    kept off: the saved rules keep only its mirror, and the Hyprland-side
+    profiles leave sets with a cast out (the plugin restores those).
+  - The automatic restore no longer changes what is on, off or mirrored
+    while a cast is live, or when the laptop mode already matches the
+    profile's (it put an extended screen over a kept mirror, and switched
+    the laptop panel back on after External only).
+  - With a cast as the only second screen, the laptop modes act on the
+    cast: Mirror and Extend change its screen with a live rule (no
+    Hyprland reload, which crashed the shell and GTK 3 programs such as the
+    browser), and Built-in only ends the cast.
 
 ### Security
 

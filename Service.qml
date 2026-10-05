@@ -95,8 +95,16 @@ Item {
   property bool storeLoaded: false
 
   readonly property var activeProfile: Profiles.profileFor(store, monitors)
-  readonly property string laptopMode: Profiles.currentLaptopMode(monitors)
-  readonly property bool hasLaptopChoice: !!Model.internalDisplay(monitors) && Model.externalDisplays(monitors).length > 0
+  // With only a cast as the second screen, the mode is the cast's:
+  // mirroring creates no output, and an extended cast's screen switched off
+  // reads as built-in only.
+  readonly property bool castOnly: castState.connected.length > 0
+    && Model.externalDisplays(monitors).every(function(e) { return Model.isVirtual(e) })
+  readonly property string laptopMode: {
+    if (castOnly && castState.connected.some(function(c) { return (c.mode || "mirror") === "mirror" })) return "mirror"
+    return Profiles.currentLaptopMode(monitors)
+  }
+  readonly property bool hasLaptopChoice: !!Model.internalDisplay(monitors) && (Model.externalDisplays(monitors).length > 0 || castState.connected.length > 0)
   // Focus comes from Quickshell's Hyprland model, so a focus change needs no
   // new read of the monitors.
   readonly property string focusedName: Hyprland.focusedMonitor ? String(Hyprland.focusedMonitor.name || "") : ""
@@ -579,8 +587,47 @@ Item {
 
   // Each laptop mode keeps its own arrangement in the profile in force;
   // switching mode brings that one back when there is one.
+  // When the second screen is a cast (a TV over Miracast or
+  // AirPlay), the laptop modes act on the cast's screen. Omarchy's mirror
+  // switch reloads all of Hyprland, which crashed GTK 3 programs (the shell
+  // among them) as the virtual output came and went, and switching that
+  // output off left the TV on its last frame. So:
+  //   Mirror         the cast's screen copies the laptop's (a live rule, no
+  //                  reload, through the usual countdown)
+  //   Extend         it is a second screen again; a cast that mirrors by
+  //                  itself is reconnected as a second screen
+  //   Built-in only  the cast ends
+  //   External only  the ordinary path (the laptop panel off)
+  function castModeNow(mode) {
+    if (!castOnly) return false
+    if (mode === "internal-only") {
+      castCommand(["disconnect", ""])
+      say("info", "Stopped casting: the laptop screen alone")
+      return true
+    }
+    if (mode !== "mirror" && mode !== "extend") return false
+    var internal = Model.internalDisplay(monitors)
+    var screens = castTargets.slice()
+    if (screens.length && internal) {
+      return applyNow(function(list) {
+        for (var i = 0; i < screens.length; i++) {
+          var e = Model.entryByName(list, screens[i])
+          if (!e) continue
+          e.enabled = true
+          e.mirror = mode === "mirror" ? internal.name : ""
+        }
+      })
+    }
+    if (mode === "mirror") { say("info", "Already mirroring"); return true }
+    var live = castState.connected
+    for (var k = 0; k < live.length; k++) if (live[k].id) castCommand(["connect", live[k].id, "extend"])
+    say("info", "Casting again as a second screen")
+    return true
+  }
+
   function laptopModeNow(mode) {
     if (!hasLaptopChoice) { say("error", "Connect an external display to choose what the laptop screen does"); return false }
+    if (castModeNow(mode)) return true
     var p = activeProfile
     if (p && p.variants && p.variants[mode]) {
       var build = function() {
@@ -933,7 +980,22 @@ Item {
       _restoreCount = 0
     }
     var want = profile ? Profiles.draftFromProfile(base, profile) : memoryDraft
-    var laptop = profile && profile.laptop && hasLaptopChoice && profile.laptop !== laptopMode ? profile.laptop : ""
+    // What is on, off or mirrored is not the restore's to change
+    // when the laptop mode already matches the profile's (Omarchy's toggles
+    // hold it, and the profile's displays read "on, not mirroring" for
+    // them), nor for a cast's live screen (the cast decides; a restore of
+    // "Built-in only" switched it off under a streaming TV).
+    var casting = castTargets.slice()
+    var modeMatches = profile && profile.laptop && profile.laptop === laptopMode
+    want = want.map(function(e) {
+      var live = Model.entryByName(base, e.name)
+      if (!live || !(modeMatches || casting.indexOf(e.name) >= 0 || Model.isVirtual(e))) return e
+      var c = Object.assign({}, e)
+      c.enabled = live.enabled
+      c.mirror = live.mirror || ""
+      return c
+    })
+    var laptop = profile && profile.laptop && hasLaptopChoice && profile.laptop !== laptopMode && !casting.length ? profile.laptop : ""
     var plan = Plan.buildPlan({ snapshot: monitors, base: base, draft: want, persist: false, workspaces: profile ? profile.workspaces : null,
                                 liveWorkspaces: workspaces, laptopMode: laptop,
                                 // Unknown live values would read as changes every time.

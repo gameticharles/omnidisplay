@@ -768,4 +768,22 @@ test("cast state: one list, sessions win over peers", () => {
   assert.deepStrictEqual(Cast.castOutputs(state), ["HEADLESS-3"])
 })
 
+// A cast's virtual output keeps no rule but a mirror.
+test("a cast's screen is never kept off, and keeps only its mirror", () => {
+  const raw = JSON.parse(fixture("monitors-laptop.json"))
+  const edp = raw.find(m => /^eDP-/.test(m.name))
+  raw.push(Object.assign({}, edp, { id: 9, name: "HEADLESS-1", description: "", make: "", model: "", serial: "", x: 1920, mirrorOf: "none", disabled: false }))
+  const live = Model.parseMonitors(JSON.stringify(raw))
+  assert.ok(Model.isVirtual(byName(live, "HEADLESS-1")))
+  assert.ok(!Model.isVirtual(byName(live, edp.name)))
+  const off = live.map(e => e.name === "HEADLESS-1" ? Object.assign({}, e, { enabled: false }) : e)
+  const offPlan = Plan.buildPlan({ snapshot: live, draft: off, fileText: "", fileState: "missing", persist: true })
+  assert.ok(offPlan.ok)
+  assert.ok(!/HEADLESS-1/.test(offPlan.block), "an off cast screen is not kept")
+  const mirror = live.map(e => e.name === "HEADLESS-1" ? Object.assign({}, e, { mirror: edp.name }) : e)
+  const mirrorPlan = Plan.buildPlan({ snapshot: live, draft: mirror, fileText: "", fileState: "missing", persist: true })
+  assert.ok(mirrorPlan.ok)
+  assert.ok(new RegExp('output = "HEADLESS-1".*mirror = "' + edp.name + '"').test(mirrorPlan.block), "a mirroring cast screen keeps its mirror")
+})
+
 finish()

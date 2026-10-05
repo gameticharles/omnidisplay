@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omnidisplay",
   "name": "OmniDisplay",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Charles Gameti",
   "license": "MIT",
   "description": "Every display setting in one bar widget: drag-and-drop arrangement, resolution, refresh, scale, rotation, mirroring, HDR and colour, adaptive sync, brightness (backlight and DDC/CI), auto-switching profiles, workspace planning, Miracast/AirPlay casting and tablet screens, with every change kept only after you confirm it.",
